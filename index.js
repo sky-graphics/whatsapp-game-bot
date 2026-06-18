@@ -85,6 +85,17 @@ if (fs.existsSync(WORDS_FILE)) {
 const games = {}
 let activeGameChat = null
 
+// IMPROVEMENT 7 (admin confirmation reliability fix):
+// The original admin-confirmation DM only ever fired inside the "first command
+// after a blank install" branch (settings.adminNumber === ''). Once that ran
+// once and saveSettings() wrote settings.json to disk, adminNumber was never
+// '' again on any future boot — including every Railway redeploy — so the
+// confirmation could never fire a second time, even though the admin and bot
+// are both still very much alive. This flag guards a NEW, separate
+// reconfirmation that fires once per process start (on the 'open' connection
+// event), independent of whether adminNumber was already set before boot.
+let hasSentBootAdminConfirmation = false
+
 function persistGames() {
     const serializable = {}
     for (const chatId in games) {
@@ -177,6 +188,33 @@ async function startBot() {
         }
         if (connection === 'open') {
             console.log('✅ WRG Bot is connected!')
+
+            // IMPROVEMENT 7: re-confirm admin status to the saved admin's DM every time
+            // the bot (re)connects — covers Railway redeploys, crash restarts, manual
+            // restarts, etc. This is intentionally separate from the one-time
+            // registration block further down (which only fires the very first time
+            // settings.adminNumber is blank): that block can structurally only ever run
+            // once per install, because saveSettings() persists adminNumber to disk and
+            // every later boot loads it back as non-empty. Without this block, redeploys
+            // after the first-ever boot would never DM the admin again even though the
+            // bot is live and the admin number is known. Guarded by
+            // hasSentBootAdminConfirmation so Baileys' internal reconnect cycles within
+            // a single process (e.g. brief network drops) don't spam the admin's DM.
+            if (!hasSentBootAdminConfirmation) {
+                hasSentBootAdminConfirmation = true
+                if (settings.adminNumber) {
+                    try {
+                        await sock.sendMessage(jidOf(settings.adminNumber), {
+                            text: `🔁 *WRG Bot is back online.*\n\n👑 You are registered as the administrator (${settings.adminNumber}).\n\nType */help* here at any time to see all admin commands.`
+                        })
+                        console.log(`👑 Sent boot/redeploy confirmation DM to admin ${settings.adminNumber}`)
+                    } catch (err) {
+                        console.log('⚠️ Could not DM the admin on boot (they may need to message the bot directly first):', err.message)
+                    }
+                } else {
+                    console.log('ℹ️ No admin set yet — skipping boot confirmation DM. Send any "/" command from WhatsApp to register the first admin.')
+                }
+            }
 
             // IMPROVEMENT 5 (continued): if a game/lobby was active when the process died,
             // recover it. Lobby timers and turn timers can't survive a restart, so we
