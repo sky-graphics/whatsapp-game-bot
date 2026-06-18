@@ -12,19 +12,58 @@ let settings = {
     difficulty: 'easy',
     maxTries: 10,
     prefix: 'wrg',
-    adminPrefix: '/'
+    adminPrefix: '/',
+    publicStart: false // false = only the admin can type WRG to start a lobby
 }
 
 // Load settings if they exist
 if (fs.existsSync(SETTINGS_FILE)) {
     settings = JSON.parse(fs.readFileSync(SETTINGS_FILE))
+    if (typeof settings.publicStart === 'undefined') settings.publicStart = false
 }
 
-// Load words pool
-let words = {
+// Persistent Name Cache (maps phone number -> real WhatsApp profile name)
+const NAMES_FILE = 'names.json'
+let nameCache = {}
+if (fs.existsSync(NAMES_FILE)) {
+    nameCache = JSON.parse(fs.readFileSync(NAMES_FILE))
+}
+
+// Saves a person's real WhatsApp profile name (pushName) the moment we see it
+function rememberName(number, pushName) {
+    if (!number || !pushName) return
+    if (nameCache[number] !== pushName) {
+        nameCache[number] = pushName
+        fs.writeFileSync(NAMES_FILE, JSON.stringify(nameCache, null, 2))
+    }
+}
+
+// Returns the real profile name if known, otherwise falls back to the number
+function displayName(number) {
+    return nameCache[number] || number
+}
+
+// Builds the "@Name" text used inside messages
+function tag(number) {
+    return `@${displayName(number)}`
+}
+
+// Builds the JID needed for WhatsApp's mentions array (always number-based, never the display name)
+function jidOf(number) {
+    return `${number}@s.whatsapp.net`
+}
+
+// Default word pools used by reset and initial installs
+const DEFAULT_WORDS = {
     easy: ['apple', 'bread', 'cloud', 'dance', 'earth', 'flame', 'grape', 'house', 'ivory', 'juice'],
     normal: ['browser', 'element', 'network', 'program', 'website', 'database', 'keyboard', 'science', 'offline', 'desktop'],
     difficult: ['algorithm', 'blockchain', 'cryptography', 'deployment', 'encryption', 'framework', 'governance', 'hierarchy', 'interface', 'javascript']
+}
+
+let words = JSON.parse(JSON.stringify(DEFAULT_WORDS))
+
+function saveWords() {
+    fs.writeFileSync(WORDS_FILE, JSON.stringify(words, null, 2))
 }
 
 if (fs.existsSync(WORDS_FILE)) {
@@ -71,6 +110,8 @@ async function startBot() {
         if (qr) {
             console.log('📱 Scan this QR code with WhatsApp:')
             qrcode.generate(qr, { small: true })
+            console.log('\n🔗 OR click this link to scan a clean QR code in your web browser:')
+            console.log(`https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qr)}\n`)
         }
         if (connection === 'close') {
             const shouldReconnect = new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut
@@ -100,8 +141,8 @@ async function startBot() {
                 await sock.sendMessage(chatId, { text: `*⚠️ Warning:* Only *5 seconds* left to join the game!` })
             } 
             else if (gameState.lobbySecondsLeft % 10 === 0) {
-                const lobbyMentions = gameState.players.map(num => `${num}@s.whatsapp.net`)
-                const lobbyText = gameState.players.map((num, i) => `${i + 1}. @${num}`).join('\n')
+                const lobbyMentions = gameState.players.map(num => jidOf(num))
+                const lobbyText = gameState.players.map((num, i) => `${i + 1}. ${tag(num)}`).join('\n')
 
                 await sock.sendMessage(chatId, { 
                     text: `*⏱️ WRG Lobby Joining:*\n*${gameState.lobbySecondsLeft} seconds* left to join! Type *wrg join* now.\n\n👥 *Lobby:*\n${lobbyText || '[No players joined yet]'}`,
@@ -131,8 +172,8 @@ async function startBot() {
         gameState.paused = false
 
         // Message 1: Final Lineup
-        const lobbyMentions = gameState.players.map(num => `${num}@s.whatsapp.net`)
-        const lobbyText = gameState.players.map((num, i) => `${i + 1}. @${num}`).join('\n')
+        const lobbyMentions = gameState.players.map(num => jidOf(num))
+        const lobbyText = gameState.players.map((num, i) => `${i + 1}. ${tag(num)}`).join('\n')
         await sock.sendMessage(chatId, {
             text: `*🎬 Lobby Closed! Game Starting!*\n\n👥 *Final Player List:*\n${lobbyText}`,
             mentions: lobbyMentions
@@ -151,8 +192,8 @@ async function startBot() {
         const nextPlayerIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
         const nextPlayerNumber = gameState.players[nextPlayerIndex]
 
-        const currentPlayerJid = `${currentPlayerNumber}@s.whatsapp.net`
-        const nextPlayerJid = `${nextPlayerNumber}@s.whatsapp.net`
+        const currentPlayerJid = jidOf(currentPlayerNumber)
+        const nextPlayerJid = jidOf(nextPlayerNumber)
 
         let boardText = ''
         if (actionFeedback) {
@@ -162,8 +203,8 @@ async function startBot() {
         boardText += `*🎮 Word Riddle Game (WRG)*\n\n`
         boardText += `Word: \`${gameState.hiddenWord.join(' ')}\` (${gameState.targetWord.length} letters)\n`
         boardText += `Attempts remaining: *${settings.maxTries - gameState.attempts}/${settings.maxTries}*\n\n`
-        boardText += `🎯 Current Player: *@${currentPlayerNumber}*\n`
-        boardText += `⏭️ Up Next: *@${nextPlayerNumber}*\n\n`
+        boardText += `🎯 Current Player: *${tag(currentPlayerNumber)}*\n`
+        boardText += `⏭️ Up Next: *${tag(nextPlayerNumber)}*\n\n`
         boardText += `_⏱️ You have 30 seconds to guess a letter or the full word!_`
 
         await sock.sendMessage(chatId, {
@@ -190,7 +231,7 @@ async function startBot() {
             gameState.turnSecondsLeft--
 
             const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
-            const currentPlayerJid = `${currentPlayerNumber}@s.whatsapp.net`
+            const currentPlayerJid = jidOf(currentPlayerNumber)
 
             if (gameState.turnSecondsLeft <= 0) {
                 clearInterval(gameState.turnTimer)
@@ -200,7 +241,7 @@ async function startBot() {
                 const nextTurnIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
                 gameState.currentTurnIndex = nextTurnIndex
 
-                const feedback = `*⏰ Timeout!*\n@${currentPlayerNumber} ran out of time.`
+                const feedback = `*⏰ Timeout!*\n${tag(currentPlayerNumber)} ran out of time.`
 
                 if (gameState.attempts >= settings.maxTries) {
                     gameState.active = false
@@ -214,19 +255,19 @@ async function startBot() {
             } 
             else if (gameState.turnSecondsLeft === 5) {
                 await sock.sendMessage(chatId, {
-                    text: `*⚠️ Turn Warning:*\n@${currentPlayerNumber}, only *5 seconds* left! Hurry!`,
+                    text: `*⚠️ Turn Warning:*\n${tag(currentPlayerNumber)}, only *5 seconds* left! Hurry!`,
                     mentions: [currentPlayerJid]
                 })
             } 
             else if (gameState.turnSecondsLeft === 10) {
                 await sock.sendMessage(chatId, {
-                    text: `*⏱️ Turn Alert:*\n@${currentPlayerNumber}, you have *10 seconds* remaining to guess a letter or the word!`,
+                    text: `*⏱️ Turn Alert:*\n${tag(currentPlayerNumber)}, you have *10 seconds* remaining to guess a letter or the word!`,
                     mentions: [currentPlayerJid]
                 })
             } 
             else if (gameState.turnSecondsLeft === 20) {
                 await sock.sendMessage(chatId, {
-                    text: `*⏱️ Turn Alert:*\n@${currentPlayerNumber}, you have *20 seconds* remaining to guess a letter or the word!`,
+                    text: `*⏱️ Turn Alert:*\n${tag(currentPlayerNumber)}, you have *20 seconds* remaining to guess a letter or the word!`,
                     mentions: [currentPlayerJid]
                 })
             }
@@ -250,11 +291,19 @@ async function startBot() {
                 ''
             const body = text.trim().toLowerCase()
             const rawBody = text.trim()
-            const senderName = msg.pushName || 'Player'
 
             // Extract sender JID and phone number
+            // NOTE: Baileys sometimes appends a device suffix (e.g. "237xxxxxxxxx:14@s.whatsapp.net").
+            // Splitting only on "@" left that ":14" stuck to the number, which is why the number
+            // looked "wrong" / different from what shows on WhatsApp. We strip it here.
             const sender = msg.key.participant || msg.key.remoteJid || ''
-            const senderNumber = sender.split('@')[0]
+            const senderNumber = sender.split('@')[0].split(':')[0]
+
+            // The real name set on the sender's WhatsApp profile (what WhatsApp calls "pushName").
+            // This is the only reliable source for "the exact name the person uses on WhatsApp" —
+            // it is NOT the same as a phone-contact name, which differs per viewer.
+            const senderName = msg.pushName || senderNumber
+            rememberName(senderNumber, msg.pushName)
 
             // Determine if the message is from the admin
             const isAdmin = msg.key.fromMe || senderNumber === settings.adminNumber || settings.adminNumber === ''
@@ -273,7 +322,7 @@ async function startBot() {
                     const adminJid = settings.adminNumber ? `${settings.adminNumber}@s.whatsapp.net` : sender
 
                     if (cmd[0] === 'admin' || cmd[0] === 'help') {
-                        const adminHelp = `*👑 WRG Admin Dashboard*\n\nHere are your configuration commands. You can type them in any chat, but the results will always be sent privately here.\n\n*Configuration Commands:*\n• \`/set difficulty [easy/normal/difficult]\` - Set default mode.\n• \`/set admin [number]\` - Update admin phone number.\n• \`/addword [level] [word]\` - Add a word to the pool.\n• \`/removeword [level] [word]\` - Delete a word.\n• \`/listwords [level]\` - View all words in a pool.\n\n*Group Game Controls:*\n• \`/pause\` - Pause the active game timer.\n• \`/resume\` - Resume the active game timer.\n• \`/end\` - Terminate the active game.`
+                        const adminHelp = `*👑 WRG Admin Dashboard*\n\nHere are your configuration commands. You can type them in any chat, but the results will always be sent privately here.\n\n*Configuration Commands:*\n• \`/set difficulty [easy/normal/difficult]\` - Set default mode.\n• \`/set admin [number]\` - Update admin phone number.\n• \`/set public [on/off]\` - Allow/restrict who can type WRG to start a game.\n• \`/addword [level] [word]\` - Add a word to the pool.\n• \`/removeword [level] [word]\` - Delete a word.\n• \`/listwords [level]\` - View all words in a pool.\n\n*Group Game Controls:*\n• \`/pause\` - Pause the active game timer.\n• \`/resume\` - Resume the active game timer.\n• \`/end\` - Terminate the active game.`
                         await sock.sendMessage(adminJid, { text: adminHelp })
                     }
                     else if (cmd[0] === 'set' && cmd[1] === 'difficulty') {
@@ -292,20 +341,99 @@ async function startBot() {
                         fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2))
                         await sock.sendMessage(adminJid, { text: `👑 Admin number updated to: *${settings.adminNumber}*` })
                     }
+                    else if (cmd[0] === 'set' && cmd[1] === 'public') {
+                        const mode = cmd[2]
+                        if (mode === 'on' || mode === 'off') {
+                            settings.publicStart = (mode === 'on')
+                            fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2))
+                            await sock.sendMessage(adminJid, {
+                                text: settings.publicStart
+                                    ? `🔓 Public starts *ENABLED*. Anyone in a chat can now type *WRG* to start a lobby.`
+                                    : `🔒 Public starts *DISABLED*. Only you (the admin) can type *WRG* to start a lobby now.`
+                            })
+                        } else {
+                            await sock.sendMessage(adminJid, { text: `⚠️ Usage: /set public [on/off]` })
+                        }
+                    }
                     else if (cmd[0] === 'addword') {
                         const level = cmd[1]
                         const word = cmd[2]
                         if (['easy', 'normal', 'difficult'].includes(level) && word) {
                             const trimmedWord = word.trim().toLowerCase()
                             if (!words[level].includes(trimmedWord)) {
-                                words[level].push(trimmedWord)
-                                fs.writeFileSync(WORDS_FILE, JSON.stringify(words, null, 2))
-                                await sock.sendMessage(adminJid, { text: `✅ Word *${trimmedWord.toUpperCase()}* added to *${level.toUpperCase()}* pool.` })
+                                if (words[level].length >= 10) {
+                                    await sock.sendMessage(adminJid, { text: `⚠️ *${level.toUpperCase()}* already has the maximum of 10 words.` })
+                                } else {
+                                    words[level].push(trimmedWord)
+                                    saveWords()
+                                    await sock.sendMessage(adminJid, { text: `✅ Word *${trimmedWord.toUpperCase()}* added to *${level.toUpperCase()}* pool.` })
+                                }
                             } else {
                                 await sock.sendMessage(adminJid, { text: `⚠️ Word *${trimmedWord.toUpperCase()}* is already in *${level.toUpperCase()}* pool.` })
                             }
                         } else {
                             await sock.sendMessage(adminJid, { text: `⚠️ Usage: /addword [easy/normal/difficult] [word]` })
+                        }
+                    }
+                    else if (cmd[0] === 'setwords') {
+                        const level = cmd[1]
+                        const newWords = cmd.slice(2).map(w => w.trim().toLowerCase()).filter(Boolean)
+                        if (['easy', 'normal', 'difficult'].includes(level) && newWords.length > 0) {
+                            if (newWords.length > 10) {
+                                await sock.sendMessage(adminJid, { text: `⚠️ You may set at most 10 words for *${level.toUpperCase()}*.` })
+                            } else {
+                                words[level] = [...new Set(newWords)]
+                                saveWords()
+                                await sock.sendMessage(adminJid, { text: `✅ *${level.toUpperCase()}* word pool replaced with ${words[level].length} word(s).` })
+                            }
+                        } else {
+                            await sock.sendMessage(adminJid, { text: `⚠️ Usage: /setwords [easy/normal/difficult] [word1] [word2] ...` })
+                        }
+                    }
+                    else if (cmd[0] === 'clearwords') {
+                        const level = cmd[1]
+                        if (['easy', 'normal', 'difficult'].includes(level)) {
+                            words[level] = []
+                            saveWords()
+                            await sock.sendMessage(adminJid, { text: `✅ *${level.toUpperCase()}* word pool has been cleared.` })
+                        } else {
+                            await sock.sendMessage(adminJid, { text: `⚠️ Usage: /clearwords [easy/normal/difficult]` })
+                        }
+                    }
+                    else if (cmd[0] === 'setallwords') {
+                        const payload = cmd.slice(1).join(' ')
+                        const segments = payload.split(/\s+(?=(easy|normal|difficult):)/i).filter(Boolean)
+                        const newPools = {}
+                        let valid = true
+                        for (const segment of segments) {
+                            const [level, list] = segment.split(':')
+                            if (!level || !list) {
+                                valid = false
+                                break
+                            }
+                            const normalizedLevel = level.trim().toLowerCase()
+                            if (!['easy', 'normal', 'difficult'].includes(normalizedLevel)) {
+                                valid = false
+                                break
+                            }
+                            const items = list.split(',').map(w => w.trim().toLowerCase()).filter(Boolean)
+                            if (items.length > 10) {
+                                await sock.sendMessage(adminJid, { text: `⚠️ *${normalizedLevel.toUpperCase()}* may not contain more than 10 words.` })
+                                valid = false
+                                break
+                            }
+                            newPools[normalizedLevel] = [...new Set(items)]
+                        }
+                        if (valid && Object.keys(newPools).length > 0) {
+                            for (const level of ['easy', 'normal', 'difficult']) {
+                                if (newPools[level]) {
+                                    words[level] = newPools[level]
+                                }
+                            }
+                            saveWords()
+                            await sock.sendMessage(adminJid, { text: `✅ Word pools updated for levels: ${Object.keys(newPools).map(l => l.toUpperCase()).join(', ')}.` })
+                        } else {
+                            await sock.sendMessage(adminJid, { text: `⚠️ Usage: /setallwords easy:word1,word2 normal:word3,word4 difficult:word5,word6` })
                         }
                     }
                     else if (cmd[0] === 'removeword') {
@@ -340,8 +468,11 @@ async function startBot() {
                             difficulty: 'easy',
                             maxTries: 10,
                             prefix: 'wrg',
-                            adminPrefix: '/'
+                            adminPrefix: '/',
+                            publicStart: false
                         }
+                        words = JSON.parse(JSON.stringify(DEFAULT_WORDS))
+                        saveWords()
                         if (fs.existsSync(SETTINGS_FILE)) fs.unlinkSync(SETTINGS_FILE)
                         for (const key in games) {
                             const g = games[key]
@@ -349,7 +480,7 @@ async function startBot() {
                             if (g.turnTimer) clearInterval(g.turnTimer)
                             delete games[key]
                         }
-                        await sock.sendMessage(adminJid, { text: `🔄 Configuration and games reset successfully.` })
+                        await sock.sendMessage(adminJid, { text: `🔄 Configuration, games, and built-in word pools have been restored.` })
                     }
                 }
                 continue
