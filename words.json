@@ -1,0 +1,38 @@
+{
+  "easy": [
+    "apple",
+    "bread",
+    "cloud",
+    "dance",
+    "earth",
+    "flame",
+    "grape",
+    "house",
+    "ivory",
+    "juice"
+  ],
+  "normal": [
+    "browser",
+    "element",
+    "network",
+    "program",
+    "website",
+    "database",
+    "keyboard",
+    "science",
+    "offline",
+    "desktop"
+  ],
+  "difficult": [
+    "algorithm",
+    "blockchain",
+    "cryptography",
+    "deployment",
+    "encryption",
+    "framework",
+    "governance",
+    "hierarchy",
+    "interface",
+    "javascript"
+  ]
+}
