@@ -1,8 +1,40 @@
+require('dotenv').config()
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys')
 const { Boom } = require('@hapi/boom')
 const qrcode = require('qrcode-terminal')
 const fs = require('fs')
 const matchSummary = require('./matchSummary')
+const Redis = require('ioredis')
+
+// Redis client — reads REDIS_URL from .env locally, Railway sets it automatically on deploy
+const redis = new Redis(process.env.REDIS_URL)
+redis.on('connect', () => console.log('✅ Redis connected'))
+redis.on('error', (err) => console.log('⚠️ Redis error:', err.message))
+
+// Safe send: resolves LID from Redis cache first, falls back to Baileys resolver, then raw PN
+async function sendSafeMessage(sock, phoneNumber, payload) {
+    const pnJid = phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`
+    let targetJid = null
+
+    // 1. Check Redis (survives restarts)
+    try {
+        targetJid = await redis.get(`lid:${pnJid}`)
+    } catch (_) {}
+
+    // 2. Fall back to Baileys in-memory LID resolver
+    if (!targetJid) {
+        try {
+            targetJid = await sock.signalRepository?.lidMapping?.getLIDForPN(pnJid)
+            if (targetJid) {
+                await redis.set(`lid:${pnJid}`, targetJid)
+                await redis.set(`pn:${targetJid}`, pnJid)
+            }
+        } catch (_) {}
+    }
+
+    // 3. Last resort — raw PN JID
+    return await sock.sendMessage(targetJid || pnJid, payload)
+}
 
 // Persistent Settings Structure
 const SETTINGS_FILE = 'settings.json'
@@ -204,7 +236,7 @@ async function startBot() {
                 hasSentBootAdminConfirmation = true
                 if (settings.adminNumber) {
                     try {
-                        await sock.sendMessage(jidOf(settings.adminNumber), {
+                        await sendSafeMessage(sock, settings.adminNumber, {
                             text: `🔁 *WRG Bot is back online.*\n\n👑 You are registered as the administrator (${settings.adminNumber}).\n\nType */help* here at any time to see all admin commands.`
                         })
                         console.log(`👑 Sent boot/redeploy confirmation DM to admin ${settings.adminNumber}`)
@@ -454,6 +486,17 @@ async function startBot() {
         for (const msg of messages) {
             if (!msg.message) continue
 
+            // Capture LID ↔ PN mapping whenever we see a message with both fields
+            // This populates Redis so outbound DMs to this number always resolve correctly
+            const incomingLid = msg.key.remoteJid
+            const incomingPn = msg.key.senderPn
+            if (incomingLid && incomingPn && incomingLid.endsWith('@lid')) {
+                try {
+                    await redis.set(`lid:${incomingPn}`, incomingLid)
+                    await redis.set(`pn:${incomingLid}`, incomingPn)
+                } catch (_) {}
+            }
+
             const from = msg.key.remoteJid
             if (from === 'status@broadcast') continue
 
@@ -497,7 +540,7 @@ async function startBot() {
 
                 // IMPROVEMENT (from Q&A): confirm admin registration via DM immediately.
                 try {
-                    await sock.sendMessage(jidOf(settings.adminNumber), {
+                    await sendSafeMessage(sock, settings.adminNumber, {
                         text: `👑 You have been registered as the WRG administrator.\n\nType */help* here at any time to see all admin commands.`
                     })
                 } catch (err) {
@@ -520,16 +563,16 @@ async function startBot() {
 
                 if (cmd[0] === 'admin' || cmd[0] === 'help') {
                     const adminHelp = `*👑 WRG Admin Dashboard*\n\nHere are your configuration commands. You can type them in *any* chat — the results always come back to this DM only, never the chat you typed them in.\n\n*Configuration Commands:*\n• \`/set difficulty [easy/normal/difficult]\` - Set default mode.\n• \`/set admin [number]\` - Update admin phone number.\n• \`/set public [on/off]\` - Allow/restrict who can type WRG to start a game.\n• \`/set maxtries [number]\` - Set the shared mistake budget (wrong letters + timeouts) for a round.\n• \`/addword [level] [word]\` - Add a word to the pool.\n• \`/removeword [level] [word]\` - Delete a word.\n• \`/listwords [level]\` - View all words in a pool.\n\n*Group Game Controls (act on whichever chat the active game is actually running in, not the chat you type from):*\n• \`/pause\` - Pause the active game timer.\n• \`/resume\` - Resume the active game timer.\n• \`/end\` - Terminate the active game.\n\n*Lockout rule:* any player who fails to respond on *3 turns in a row* is removed from the round. If that leaves zero players, the round ends immediately — it never auto-restarts; only typing *WRG* again starts a new one. If exactly one player remains after disqualifications, they win instantly as Last Player Standing.`
-                    await sock.sendMessage(adminJid, { text: adminHelp })
+                    await sendSafeMessage(sock, adminJid, { text: adminHelp })
                 }
                 else if (cmd[0] === 'set' && cmd[1] === 'difficulty') {
                     const newDiff = cmd[2]
                     if (['easy', 'normal', 'difficult'].includes(newDiff)) {
                         settings.difficulty = newDiff
                         saveSettings()
-                        await sock.sendMessage(adminJid, { text: `⚙️ Default difficulty updated to: *${settings.difficulty.toUpperCase()}*` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚙️ Default difficulty updated to: *${settings.difficulty.toUpperCase()}*` })
                     } else {
-                        await sock.sendMessage(adminJid, { text: `⚠️ Invalid difficulty. Choose: easy, normal, or difficult.` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚠️ Invalid difficulty. Choose: easy, normal, or difficult.` })
                     }
                 }
                 else if (cmd[0] === 'set' && cmd[1] === 'admin') {
@@ -537,16 +580,16 @@ async function startBot() {
                     if (newAdmin) {
                         settings.adminNumber = newAdmin
                         saveSettings()
-                        await sock.sendMessage(adminJid, { text: `👑 Admin number updated to: *${settings.adminNumber}*` })
+                        await sendSafeMessage(sock, adminJid, { text: `👑 Admin number updated to: *${settings.adminNumber}*` })
                         try {
-                            await sock.sendMessage(jidOf(settings.adminNumber), {
+                            await sendSafeMessage(sock, settings.adminNumber, {
                                 text: `👑 You have been registered as the WRG administrator.\n\nType */help* here at any time to see all admin commands.`
                             })
                         } catch (err) {
                             console.log('⚠️ Could not DM the new admin:', err.message)
                         }
                     } else {
-                        await sock.sendMessage(adminJid, { text: `⚠️ Usage: /set admin [number]` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚠️ Usage: /set admin [number]` })
                     }
                 }
                 else if (cmd[0] === 'set' && cmd[1] === 'maxtries') {
@@ -554,9 +597,9 @@ async function startBot() {
                     if (Number.isInteger(n) && n > 0) {
                         settings.maxTries = n
                         saveSettings()
-                        await sock.sendMessage(adminJid, { text: `⚙️ Max attempts per round updated to: *${settings.maxTries}*` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚙️ Max attempts per round updated to: *${settings.maxTries}*` })
                     } else {
-                        await sock.sendMessage(adminJid, { text: `⚠️ Usage: /set maxtries [positive number]` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚠️ Usage: /set maxtries [positive number]` })
                     }
                 }
                 else if (cmd[0] === 'set' && cmd[1] === 'public') {
@@ -564,13 +607,13 @@ async function startBot() {
                     if (mode === 'on' || mode === 'off') {
                         settings.publicStart = (mode === 'on')
                         saveSettings()
-                        await sock.sendMessage(adminJid, {
+                        await sendSafeMessage(sock, adminJid, {
                             text: settings.publicStart
                                 ? `🔓 Public starts *ENABLED*. Anyone in a chat can now type *WRG* to start a lobby.`
                                 : `🔒 Public starts *DISABLED*. Only you (the admin) can type *WRG* to start a lobby now.`
                         })
                     } else {
-                        await sock.sendMessage(adminJid, { text: `⚠️ Usage: /set public [on/off]` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚠️ Usage: /set public [on/off]` })
                     }
                 }
                 else if (cmd[0] === 'addword') {
@@ -580,17 +623,17 @@ async function startBot() {
                         const trimmedWord = word.trim().toLowerCase()
                         if (!words[level].includes(trimmedWord)) {
                             if (words[level].length >= 10) {
-                                await sock.sendMessage(adminJid, { text: `⚠️ *${level.toUpperCase()}* already has the maximum of 10 words.` })
+                                await sendSafeMessage(sock, adminJid, { text: `⚠️ *${level.toUpperCase()}* already has the maximum of 10 words.` })
                             } else {
                                 words[level].push(trimmedWord)
                                 saveWords()
-                                await sock.sendMessage(adminJid, { text: `✅ Word *${trimmedWord.toUpperCase()}* added to *${level.toUpperCase()}* pool.` })
+                                await sendSafeMessage(sock, adminJid, { text: `✅ Word *${trimmedWord.toUpperCase()}* added to *${level.toUpperCase()}* pool.` })
                             }
                         } else {
-                            await sock.sendMessage(adminJid, { text: `⚠️ Word *${trimmedWord.toUpperCase()}* is already in *${level.toUpperCase()}* pool.` })
+                            await sendSafeMessage(sock, adminJid, { text: `⚠️ Word *${trimmedWord.toUpperCase()}* is already in *${level.toUpperCase()}* pool.` })
                         }
                     } else {
-                        await sock.sendMessage(adminJid, { text: `⚠️ Usage: /addword [easy/normal/difficult] [word]` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚠️ Usage: /addword [easy/normal/difficult] [word]` })
                     }
                 }
                 else if (cmd[0] === 'setwords') {
@@ -598,14 +641,14 @@ async function startBot() {
                     const newWords = cmd.slice(2).map(w => w.trim().toLowerCase()).filter(Boolean)
                     if (['easy', 'normal', 'difficult'].includes(level) && newWords.length > 0) {
                         if (newWords.length > 10) {
-                            await sock.sendMessage(adminJid, { text: `⚠️ You may set at most 10 words for *${level.toUpperCase()}*.` })
+                            await sendSafeMessage(sock, adminJid, { text: `⚠️ You may set at most 10 words for *${level.toUpperCase()}*.` })
                         } else {
                             words[level] = [...new Set(newWords)]
                             saveWords()
-                            await sock.sendMessage(adminJid, { text: `✅ *${level.toUpperCase()}* word pool replaced with ${words[level].length} word(s).` })
+                            await sendSafeMessage(sock, adminJid, { text: `✅ *${level.toUpperCase()}* word pool replaced with ${words[level].length} word(s).` })
                         }
                     } else {
-                        await sock.sendMessage(adminJid, { text: `⚠️ Usage: /setwords [easy/normal/difficult] [word1] [word2] ...` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚠️ Usage: /setwords [easy/normal/difficult] [word1] [word2] ...` })
                     }
                 }
                 else if (cmd[0] === 'clearwords') {
@@ -613,9 +656,9 @@ async function startBot() {
                     if (['easy', 'normal', 'difficult'].includes(level)) {
                         words[level] = []
                         saveWords()
-                        await sock.sendMessage(adminJid, { text: `✅ *${level.toUpperCase()}* word pool has been cleared.` })
+                        await sendSafeMessage(sock, adminJid, { text: `✅ *${level.toUpperCase()}* word pool has been cleared.` })
                     } else {
-                        await sock.sendMessage(adminJid, { text: `⚠️ Usage: /clearwords [easy/normal/difficult]` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚠️ Usage: /clearwords [easy/normal/difficult]` })
                     }
                 }
                 else if (cmd[0] === 'setallwords') {
@@ -636,7 +679,7 @@ async function startBot() {
                         }
                         const items = list.split(',').map(w => w.trim().toLowerCase()).filter(Boolean)
                         if (items.length > 10) {
-                            await sock.sendMessage(adminJid, { text: `⚠️ *${normalizedLevel.toUpperCase()}* may not contain more than 10 words.` })
+                            await sendSafeMessage(sock, adminJid, { text: `⚠️ *${normalizedLevel.toUpperCase()}* may not contain more than 10 words.` })
                             valid = false
                             break
                         }
@@ -649,9 +692,9 @@ async function startBot() {
                             }
                         }
                         saveWords()
-                        await sock.sendMessage(adminJid, { text: `✅ Word pools updated for levels: ${Object.keys(newPools).map(l => l.toUpperCase()).join(', ')}.` })
+                        await sendSafeMessage(sock, adminJid, { text: `✅ Word pools updated for levels: ${Object.keys(newPools).map(l => l.toUpperCase()).join(', ')}.` })
                     } else {
-                        await sock.sendMessage(adminJid, { text: `⚠️ Usage: /setallwords easy:word1,word2 normal:word3,word4 difficult:word5,word6` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚠️ Usage: /setallwords easy:word1,word2 normal:word3,word4 difficult:word5,word6` })
                     }
                 }
                 else if (cmd[0] === 'removeword') {
@@ -663,21 +706,21 @@ async function startBot() {
                         if (index !== -1) {
                             words[level].splice(index, 1)
                             saveWords()
-                            await sock.sendMessage(adminJid, { text: `❌ Word *${trimmedWord.toUpperCase()}* removed from *${level.toUpperCase()}* pool.` })
+                            await sendSafeMessage(sock, adminJid, { text: `❌ Word *${trimmedWord.toUpperCase()}* removed from *${level.toUpperCase()}* pool.` })
                         } else {
-                            await sock.sendMessage(adminJid, { text: `⚠️ Word *${trimmedWord.toUpperCase()}* not found in *${level.toUpperCase()}* pool.` })
+                            await sendSafeMessage(sock, adminJid, { text: `⚠️ Word *${trimmedWord.toUpperCase()}* not found in *${level.toUpperCase()}* pool.` })
                         }
                     } else {
-                        await sock.sendMessage(adminJid, { text: `⚠️ Usage: /removeword [easy/normal/difficult] [word]` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚠️ Usage: /removeword [easy/normal/difficult] [word]` })
                     }
                 }
                 else if (cmd[0] === 'listwords') {
                     const level = cmd[1]
                     if (['easy', 'normal', 'difficult'].includes(level)) {
                         const list = words[level].join(', ')
-                        await sock.sendMessage(adminJid, { text: `📖 *${level.toUpperCase()} Pool words:*\n\n${list || '[Empty]'}` })
+                        await sendSafeMessage(sock, adminJid, { text: `📖 *${level.toUpperCase()} Pool words:*\n\n${list || '[Empty]'}` })
                     } else {
-                        await sock.sendMessage(adminJid, { text: `⚠️ Usage: /listwords [easy/normal/difficult]` })
+                        await sendSafeMessage(sock, adminJid, { text: `⚠️ Usage: /listwords [easy/normal/difficult]` })
                     }
                 }
                 else if (cmd[0] === 'reset') {
@@ -700,43 +743,43 @@ async function startBot() {
                         delete games[key]
                     }
                     activeGameChat = null
-                    await sock.sendMessage(adminJid, { text: `🔄 Configuration, games, and built-in word pools have been restored.` })
+                    await sendSafeMessage(sock, adminJid, { text: `🔄 Configuration, games, and built-in word pools have been restored.` })
                 }
                 // --- Game control commands: these always act on the chat the active game is
                 // actually running in (activeGameChat), never on whatever chat the admin typed
                 // from, and they always reply to the admin's DM only.
                 else if (cmd[0] === 'pause') {
                     if (!activeGameChat) {
-                        await sock.sendMessage(adminJid, { text: '⚠️ No active game to pause right now.' })
+                        await sendSafeMessage(sock, adminJid, { text: '⚠️ No active game to pause right now.' })
                     } else {
                         const gs = getGameState(activeGameChat)
                         if (gs.active && !gs.paused) {
                             gs.paused = true
                             persistGames()
-                            await sock.sendMessage(adminJid, { text: '⏸️ Game timer paused.' })
+                            await sendSafeMessage(sock, adminJid, { text: '⏸️ Game timer paused.' })
                         } else {
-                            await sock.sendMessage(adminJid, { text: '⚠️ The game is already paused, or no round is currently in progress.' })
+                            await sendSafeMessage(sock, adminJid, { text: '⚠️ The game is already paused, or no round is currently in progress.' })
                         }
                     }
                 }
                 else if (cmd[0] === 'resume') {
                     if (!activeGameChat) {
-                        await sock.sendMessage(adminJid, { text: '⚠️ No active game to resume right now.' })
+                        await sendSafeMessage(sock, adminJid, { text: '⚠️ No active game to resume right now.' })
                     } else {
                         const gs = getGameState(activeGameChat)
                         if (gs.active && gs.paused) {
                             gs.paused = false
                             persistGames()
-                            await sock.sendMessage(adminJid, { text: '▶️ Game timer resumed.' })
+                            await sendSafeMessage(sock, adminJid, { text: '▶️ Game timer resumed.' })
                             startTurnCountdown(activeGameChat)
                         } else {
-                            await sock.sendMessage(adminJid, { text: '⚠️ The game is not currently paused.' })
+                            await sendSafeMessage(sock, adminJid, { text: '⚠️ The game is not currently paused.' })
                         }
                     }
                 }
                 else if (cmd[0] === 'end' || cmd[0] === 'stop') {
                     if (!activeGameChat) {
-                        await sock.sendMessage(adminJid, { text: '⚠️ No active game or lobby to end right now.' })
+                        await sendSafeMessage(sock, adminJid, { text: '⚠️ No active game or lobby to end right now.' })
                     } else {
                         const gs = getGameState(activeGameChat)
                         const endedChat = activeGameChat
@@ -750,7 +793,7 @@ async function startBot() {
                         gs.disqualified = []
                         activeGameChat = null
                         persistGames()
-                        await sock.sendMessage(adminJid, { text: '🛑 Game terminated.' })
+                        await sendSafeMessage(sock, adminJid, { text: '🛑 Game terminated.' })
                         await sock.sendMessage(endedChat, { text: '🛑 *The game has been terminated by the admin.*' })
                     }
                 }
