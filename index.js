@@ -593,25 +593,63 @@ async function startBot() {
                                 await sendGameBoard(from, feedback, [resolveJid(senderNumber, gameState.playerJids)], buildCtx(sock))
                             }
                         } else {
-                            // Wrong letter
-                            gameState.attempts++
-                            const nextTurnIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
-                            gameState.currentTurnIndex = nextTurnIndex
+                            // Wrong letter — track per-player
+                            gameState.attempts[currentPlayerNumber] = (gameState.attempts[currentPlayerNumber] || 0) + 1
 
                             const feedback =
                                 `❌ *Wrong guess!*\n` +
-                                `${tag(senderNumber)} guessed *${body.toUpperCase()}* — not in the word. 🔴`
+                                `${tag(senderNumber)} guessed *${body.toUpperCase()}* — not in the word. 🔴\n` +
+                                `_(${gameState.attempts[currentPlayerNumber]}/${settings.maxTries} wrong guesses for this player)_`
 
-                            if (gameState.attempts >= settings.maxTries) {
-                                gameState.active = false
-                                activeGameChatRef.value = null
-                                await sock.sendMessage(from, {
-                                    text: `${feedback}\n\n💀 *GAME OVER!* Attempts exhausted. The word was *${gameState.targetWord.toUpperCase()}*.`
-                                })
-                                await matchSummary.sendMatchReport(sock, from, gameState, { type: 'no_winner' }, tag)
-                                gameState.players = []
-                                persistGames()
+                            if (gameState.attempts[currentPlayerNumber] >= settings.maxTries) {
+                                // This player has exhausted their attempts — disqualify them
+                                matchSummary.recordDisqualification(gameState, currentPlayerNumber, 'ATTEMPTS_EXHAUSTED')
+
+                                const removedIndex = gameState.currentTurnIndex
+                                delete gameState.playerNames[currentPlayerNumber]
+                                delete gameState.skipStreaks[currentPlayerNumber]
+                                delete gameState.attempts[currentPlayerNumber]
+                                if (gameState.players.includes(currentPlayerNumber)) {
+                                    gameState.players.splice(gameState.players.indexOf(currentPlayerNumber), 1)
+                                }
+
+                                const dqFeedback =
+                                    `${feedback}\n\n` +
+                                    `🚫 *Disqualified!*\n` +
+                                    `${tag(currentPlayerNumber)} has used all *${settings.maxTries}* wrong guesses and has been eliminated. 💀`
+
+                                const lastStanding = matchSummary.checkLastPlayerStanding(gameState)
+                                if (lastStanding) {
+                                    gameState.active = false
+                                    activeGameChatRef.value = null
+                                    await sock.sendMessage(from, {
+                                        text:
+                                            `${dqFeedback}\n\n` +
+                                            `🏆 *LAST PLAYER STANDING!*\n` +
+                                            `The word was *${gameState.targetWord.toUpperCase()}*. 🎉`
+                                    })
+                                    await matchSummary.sendMatchReport(sock, from, gameState, { type: 'last_standing', winnerNumber: lastStanding }, tag)
+                                    gameState.players = []
+                                    persistGames()
+                                } else if (gameState.players.length === 0) {
+                                    gameState.active = false
+                                    activeGameChatRef.value = null
+                                    await sock.sendMessage(from, {
+                                        text:
+                                            `${dqFeedback}\n\n` +
+                                            `💀 *GAME OVER!* No players remain.\n` +
+                                            `The word was *${gameState.targetWord.toUpperCase()}*.`
+                                    })
+                                    await matchSummary.sendMatchReport(sock, from, gameState, { type: 'no_winner' }, tag)
+                                    persistGames()
+                                } else {
+                                    gameState.currentTurnIndex = removedIndex % gameState.players.length
+                                    await sendGameBoard(from, dqFeedback, [], buildCtx(sock))
+                                }
                             } else {
+                                // Attempts not exhausted — rotate turn normally
+                                const nextTurnIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
+                                gameState.currentTurnIndex = nextTurnIndex
                                 await sendGameBoard(from, feedback, [], buildCtx(sock))
                             }
                         }

@@ -26,7 +26,7 @@ function getGameState(chatId, games, settings) {
             turnSecondsLeft: 30,
             targetWord: '',
             hiddenWord: [],
-            attempts: 0,
+            attempts: {},       // Per-player attempt counters: { playerNumber: count }
             players: [],
             playerNames: {},
             skipStreaks: {},
@@ -37,6 +37,8 @@ function getGameState(chatId, games, settings) {
         }
     }
     if (!games[chatId].disqualified) games[chatId].disqualified = []
+    // Migrate any old installs that stored attempts as a number
+    if (typeof games[chatId].attempts === 'number') games[chatId].attempts = {}
     return games[chatId]
 }
 
@@ -99,7 +101,11 @@ async function startActualGame(chatId, ctx) {
     const pool = words[gameState.difficulty] || words.easy
     gameState.targetWord = pool[Math.floor(Math.random() * pool.length)]
     gameState.hiddenWord = gameState.targetWord.split('').map(() => '_')
-    gameState.attempts = 0
+
+    // Initialise a fresh per-player attempts counter for every player in the round
+    gameState.attempts = {}
+    gameState.players.forEach(p => { gameState.attempts[p] = 0 })
+
     gameState.skipStreaks = {}
     gameState.disqualified = []
     gameState.currentTurnIndex = 0
@@ -125,6 +131,7 @@ async function startActualGame(chatId, ctx) {
 
 /**
  * Sends the game board UI with current word state, player turns, and starts the turn timer.
+ * Shows the CURRENT player's personal remaining attempts, not a shared pool.
  */
 async function sendGameBoard(chatId, actionFeedback = '', extraMentions = [], ctx) {
     const { sock, games, settings, persistGames, jidOf } = ctx
@@ -134,6 +141,10 @@ async function sendGameBoard(chatId, actionFeedback = '', extraMentions = [], ct
     const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
     const currentPlayerJid = jidOf(currentPlayerNumber)
     const currentPlayerName = gameState.playerNames[currentPlayerNumber] || currentPlayerNumber
+
+    // Per-player remaining attempts for the current player only
+    const playerAttempts = gameState.attempts[currentPlayerNumber] ?? 0
+    const attemptsLeft = settings.maxTries - playerAttempts
 
     const hasMultiplePlayers = gameState.players.length > 1
     let nextPlayerNumber = null, nextPlayerJid = null, nextPlayerName = null
@@ -149,7 +160,7 @@ async function sendGameBoard(chatId, actionFeedback = '', extraMentions = [], ct
 
     boardText += `🎮 *Word Riddle Game (WRG)*\n\n`
     boardText += `📝 Word: \`${gameState.hiddenWord.join(' ')}\` *(${gameState.targetWord.length} letters)*\n`
-    boardText += `💥 Attempts left: *${settings.maxTries - gameState.attempts}/${settings.maxTries}*\n\n`
+    boardText += `💥 *@${currentPlayerNumber}'s attempts left: ${attemptsLeft}/${settings.maxTries}*\n\n`
     boardText += `🎯 *Your turn:* @${currentPlayerNumber} (${currentPlayerName})\n`
     if (hasMultiplePlayers) {
         boardText += `⏭️ *Up next:* @${nextPlayerNumber} (${nextPlayerName})\n\n`
@@ -166,7 +177,9 @@ async function sendGameBoard(chatId, actionFeedback = '', extraMentions = [], ct
 }
 
 /**
- * Starts the 30-second per-turn countdown. Times out the current player if they don't respond.
+ * Starts the 30-second per-turn countdown.
+ * Timeouts only count toward skip streaks — they do NOT consume the player's attempt budget.
+ * Attempt budget is only reduced by wrong letter/word guesses (handled in index.js).
  */
 function startTurnCountdown(chatId, ctx) {
     const { sock, games, settings, activeGameChatRef, persistGames, jidOf, tag } = ctx
@@ -189,44 +202,58 @@ function startTurnCountdown(chatId, ctx) {
         if (gameState.turnSecondsLeft <= 0) {
             clearInterval(gameState.turnTimer)
 
-            gameState.attempts++
+            // Timeout = skip only. Does NOT reduce the player's attempt budget.
             gameState.skipStreaks[currentPlayerNumber] = (gameState.skipStreaks[currentPlayerNumber] || 0) + 1
             const skipCount = gameState.skipStreaks[currentPlayerNumber]
             const removedIndex = gameState.currentTurnIndex
 
             if (skipCount >= 3) {
+                // 3 consecutive no-responses → disqualify this player
                 matchSummary.recordDisqualification(gameState, currentPlayerNumber, matchSummary.DQ_REASONS.SKIPPED_3)
+
+                // Clean up this player's entries from all tracking objects
+                gameState.players.splice(removedIndex, 1)
+                delete gameState.playerNames[currentPlayerNumber]
+                delete gameState.skipStreaks[currentPlayerNumber]
+                delete gameState.attempts[currentPlayerNumber]
 
                 const dqText =
                     `🚫 *Disqualified!*\n` +
                     `${tag(currentPlayerNumber)} skipped *3 turns in a row* without a single guess. They've been removed from the round. 👋`
 
+                // Check if someone has won by being last standing
                 const lastStanding = matchSummary.checkLastPlayerStanding(gameState)
                 if (lastStanding) {
                     gameState.active = false
                     activeGameChatRef.value = null
-                    await sock.sendMessage(chatId, { text: `${dqText}\n\n🏆 *LAST PLAYER STANDING!* The word was *${gameState.targetWord.toUpperCase()}*. 🎉` })
+                    await sock.sendMessage(chatId, {
+                        text: `${dqText}\n\n🏆 *LAST PLAYER STANDING!* The word was *${gameState.targetWord.toUpperCase()}*. 🎉`
+                    })
                     await matchSummary.sendMatchReport(sock, chatId, gameState, { type: 'last_standing', winnerNumber: lastStanding }, tag)
                     gameState.players = []
                     persistGames()
                     return
                 }
 
+                // No players left at all → game over, no winner
                 if (gameState.players.length === 0) {
                     gameState.active = false
                     activeGameChatRef.value = null
-                    await sock.sendMessage(chatId, { text: `${dqText}\n\n💀 *GAME OVER!* No players remain. The word was *${gameState.targetWord.toUpperCase()}*.` })
+                    await sock.sendMessage(chatId, {
+                        text: `${dqText}\n\n💀 *GAME OVER!* No players remain. The word was *${gameState.targetWord.toUpperCase()}*.`
+                    })
                     await matchSummary.sendMatchReport(sock, chatId, gameState, { type: 'no_winner' }, tag)
                     persistGames()
                     return
                 }
 
+                // Other players remain — continue the round
                 gameState.currentTurnIndex = removedIndex % gameState.players.length
                 await sendGameBoard(chatId, dqText, [currentPlayerJid], ctx)
                 return
             }
 
-            // Normal timeout — rotate turn
+            // Normal timeout (under 3 skips) — rotate to next player, no attempt penalty
             const nextTurnIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
             gameState.currentTurnIndex = nextTurnIndex
 
@@ -235,18 +262,8 @@ function startTurnCountdown(chatId, ctx) {
                 `${tag(currentPlayerNumber)} took too long to respond. ` +
                 `(${skipCount}/3 strikes before lockout 🟥)`
 
-            if (gameState.attempts >= settings.maxTries) {
-                gameState.active = false
-                activeGameChatRef.value = null
-                await sock.sendMessage(chatId, {
-                    text: `${feedback}\n\n💀 *GAME OVER!* Attempts exhausted. The word was *${gameState.targetWord.toUpperCase()}*.`,
-                    mentions: [currentPlayerJid]
-                })
-                await matchSummary.sendMatchReport(sock, chatId, gameState, { type: 'no_winner' }, tag)
-                persistGames()
-            } else {
-                await sendGameBoard(chatId, feedback, [], ctx)
-            }
+            await sendGameBoard(chatId, feedback, [], ctx)
+
         } else if (gameState.turnSecondsLeft === 20) {
             await sock.sendMessage(chatId, {
                 text: `⏱️ *Heads up!* ${tag(currentPlayerNumber)}, you have *20 seconds* left — guess a letter or the full word! 🤔`,
