@@ -372,6 +372,7 @@ async function startBot() {
                     startTurnCountdown: (chatId) => startTurnCountdown(chatId, buildCtx(sock)),
                     fs,
                     senderNumber,
+                    senderName,
                     senderJid: sender,
                     sender: from,
                     body,
