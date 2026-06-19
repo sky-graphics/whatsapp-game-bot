@@ -14,6 +14,11 @@
 // ============================================================
 
 const crypto = require('crypto')
+const {
+    TIERS, getTier, isCreator: isCreatorFn, isAdmin: isAdminFn,
+    canRunCommand, difficultyBadge, writeSetting, resolveSetting,
+    getReplyTarget, nameTag
+} = require('./permissions')
 
 // ─── Pending key sessions ────────────────────────────────────
 // Map: senderJid → { key, expiresAt, senderNumber, senderName, attempts }
@@ -564,10 +569,10 @@ async function handleAdminCommand(ctx) {
     if (cmd[0] === 'set' && cmd[1] === 'difficulty') {
         const newDiff = cmd[2]
         if (['easy', 'normal', 'difficult'].includes(newDiff)) {
-            settings.difficulty = newDiff
+            writeSetting(tier, 'difficulty', newDiff, settings)
             saveSettings()
             await sendSafeMessage(sock, replyTo, {
-                text: `⚙️ Difficulty set to *${settings.difficulty.toUpperCase()}* 🎯`
+                text: `⚙️ Difficulty set to: ${difficultyBadge(newDiff)} 🎯`
             })
         } else {
             await sendSafeMessage(sock, replyTo, {
@@ -666,7 +671,7 @@ async function handleAdminCommand(ctx) {
     if (cmd[0] === 'set' && cmd[1] === 'public') {
         const mode = cmd[2]
         if (mode === 'on' || mode === 'off') {
-            settings.publicVisible = (mode === 'on')
+            writeSetting(tier, 'publicVisible', (mode === 'on'), settings)
             saveSettings()
             await sendSafeMessage(sock, replyTo, {
                 text: settings.publicVisible
@@ -683,7 +688,7 @@ async function handleAdminCommand(ctx) {
     if (cmd[0] === 'set' && cmd[1] === 'start') {
         const mode = cmd[2]
         if (mode === 'on' || mode === 'off') {
-            settings.publicCanStart = (mode === 'on')
+            writeSetting(tier, 'publicCanStart', (mode === 'on'), settings)
             saveSettings()
             await sendSafeMessage(sock, replyTo, {
                 text: settings.publicCanStart
@@ -938,7 +943,8 @@ async function handleAdminCommand(ctx) {
                 statusText += `🎮 *GAME IN PROGRESS* — ${activeGameChat}\n`
                 statusText += gs.paused ? `⏸️ Status: *PAUSED*\n` : `▶️ Status: *LIVE*\n`
                 statusText += `📝 Word: \`${gs.hiddenWord.join(' ')}\` (${gs.targetWord.length} letters)\n`
-                statusText += `💥 Attempts left: *${settings.maxTries - gs.attempts}/${settings.maxTries}*\n`
+                const attemptsUsed = Object.values(gs.attempts || {}).reduce((a, b) => a + b, 0)
+                statusText += `💥 Wrong guesses so far: *${attemptsUsed}* total (max ${settings.maxTries}/player)\n`
                 statusText += `🎯 Current turn: *${gs.playerNames[currentPlayer] || currentPlayer}*\n`
                 statusText += `👥 Players: *${gs.players.length}*\n`
                 if (!gs.paused) statusText += `⏱️ Turn timer: *${gs.turnSecondsLeft}s*\n`
@@ -960,7 +966,7 @@ async function handleAdminCommand(ctx) {
         if (!activeGameChat) {
             await sendSafeMessage(sock, replyTo, { text: `⚠️ No active game to pause right now.` })
         } else {
-            const gs = getGameState(activeGameChat, games, settings)
+            const gs = getGameState(activeGameChat)
             if (gs.active && !gs.paused) {
                 gs.paused = true
                 persistGames()
@@ -981,7 +987,7 @@ async function handleAdminCommand(ctx) {
         if (!activeGameChat) {
             await sendSafeMessage(sock, replyTo, { text: `⚠️ No active game to resume right now.` })
         } else {
-            const gs = getGameState(activeGameChat, games, settings)
+            const gs = getGameState(activeGameChat)
             if (gs.active && gs.paused) {
                 gs.paused = false
                 persistGames()
@@ -989,9 +995,7 @@ async function handleAdminCommand(ctx) {
                 await sock.sendMessage(activeGameChat, {
                     text: `▶️ *Game resumed by the admin!* Back in action — keep guessing! 🔥`
                 })
-                startTurnCountdown(activeGameChat, {
-                    sock, games, settings, activeGameChatRef, persistGames, jidOf, tag
-                })
+                startTurnCountdown(activeGameChat)
             } else {
                 await sendSafeMessage(sock, replyTo, {
                     text: `⚠️ Game is not currently paused.`
@@ -1005,7 +1009,7 @@ async function handleAdminCommand(ctx) {
         if (!activeGameChat) {
             await sendSafeMessage(sock, replyTo, { text: `⚠️ No active game or lobby to end right now.` })
         } else {
-            const gs        = getGameState(activeGameChat, games, settings)
+            const gs        = getGameState(activeGameChat)
             const endedChat = activeGameChat
             gs.active = false
             gs.lobbyActive = false

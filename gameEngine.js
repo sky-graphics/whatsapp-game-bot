@@ -1,54 +1,61 @@
 // ============================================================
 //  gameEngine.js — WRG Bot · Sky Graphics
-//  Pure game logic: lobby, countdowns, boards, turn management
-//  No global state — everything passed via context object
+//  Pure game logic: lobby, countdowns, boards, turn management.
+//  Imports permissions.js for difficulty display + nameTag only.
+//  No admin logic, no command handling.
 // ============================================================
 
 const matchSummary = require('./matchSummary')
+const { difficultyBadge, nameTag } = require('./permissions')
 
 const DEFAULT_WORDS = {
-    easy: ['apple', 'bread', 'cloud', 'dance', 'earth', 'flame', 'grape', 'house', 'ivory', 'juice'],
-    normal: ['browser', 'element', 'network', 'program', 'website', 'database', 'keyboard', 'science', 'offline', 'desktop'],
+    easy:      ['apple', 'bread', 'cloud', 'dance', 'earth', 'flame', 'grape', 'house', 'ivory', 'juice'],
+    normal:    ['browser', 'element', 'network', 'program', 'website', 'database', 'keyboard', 'science', 'offline', 'desktop'],
     difficult: ['algorithm', 'blockchain', 'cryptography', 'deployment', 'encryption', 'framework', 'governance', 'hierarchy', 'interface', 'javascript']
 }
 
+// ─── getGameState ─────────────────────────────────────────────
 /**
- * Returns (and lazily creates) the game state object for a given chat.
+ * Returns (and lazily creates) the game state for a chat.
+ * NOTE: difficulty is NOT cached on gameState — it is always read
+ * live from settings at word-pick time so /set difficulty takes
+ * effect immediately, even mid-lobby.
  */
-function getGameState(chatId, games, settings) {
+function getGameState(chatId, games) {
     if (!games[chatId]) {
         games[chatId] = {
-            active: false,
-            lobbyActive: false,
-            lobbyTimer: null,
+            active:          false,
+            lobbyActive:     false,
+            lobbyTimer:      null,
             lobbySecondsLeft: 60,
-            turnTimer: null,
+            turnTimer:       null,
             turnSecondsLeft: 30,
-            targetWord: '',
-            hiddenWord: [],
-            attempts: {},       // Per-player attempt counters: { playerNumber: count }
-            players: [],
-            playerNames: {},
-            skipStreaks: {},
-            disqualified: [],
+            targetWord:      '',
+            hiddenWord:      [],
+            attempts:        {},   // per-player: { [playerNumber]: count }
+            players:         [],
+            playerNames:     {},
+            playerJids:      {},   // { [playerNumber]: JID } — resolved at join time
+            skipStreaks:     {},
+            disqualified:    [],
             currentTurnIndex: 0,
-            difficulty: settings.difficulty,
-            paused: false
+            paused:          false
         }
     }
-    if (!games[chatId].disqualified) games[chatId].disqualified = []
-    // Migrate any old installs that stored attempts as a number
+    // Migrate old single-number attempts field to object (safe on old persisted state)
     if (typeof games[chatId].attempts === 'number') games[chatId].attempts = {}
+    if (!games[chatId].disqualified) games[chatId].disqualified = []
+    if (!games[chatId].playerJids)   games[chatId].playerJids   = {}
     return games[chatId]
 }
 
+// ─── Lobby countdown ──────────────────────────────────────────
 /**
- * Starts the 60-second lobby countdown.
- * ctx = { sock, games, settings, words, activeGameChatRef, persistGames, jidOf, tag }
+ * ctx = { sock, games, settings, words, activeGameChatRef, persistGames, nameCache }
  */
 function startLobbyCountdown(chatId, ctx) {
-    const { sock, games, settings, persistGames, jidOf } = ctx
-    const gameState = getGameState(chatId, games, settings)
+    const { sock, games, settings, persistGames } = ctx
+    const gameState = getGameState(chatId, games)
     if (gameState.lobbyTimer) clearInterval(gameState.lobbyTimer)
 
     gameState.lobbyTimer = setInterval(async () => {
@@ -62,16 +69,20 @@ function startLobbyCountdown(chatId, ctx) {
         if (gameState.lobbySecondsLeft <= 0) {
             clearInterval(gameState.lobbyTimer)
             await startActualGame(chatId, ctx)
+
         } else if (gameState.lobbySecondsLeft % 10 === 0) {
-            const lobbyMentions = gameState.players.map(num => jidOf(num))
+            // Read difficulty LIVE from settings — not from cached gameState
+            const difficulty = settings.difficulty || 'easy'
+            const lobbyMentions = gameState.players.map(num => gameState.playerJids[num]).filter(Boolean)
             const lobbyText = gameState.players
-                .map((num, i) => `${i + 1}. @${num} (${gameState.playerNames[num] || num})`)
+                .map((num, i) => `${i + 1}. ${nameTag(num, gameState.playerNames, settings)}`)
                 .join('\n')
 
             await sock.sendMessage(chatId, {
                 text:
                     `⏱️ *WRG Lobby — Hurry Up!*\n` +
-                    `*${gameState.lobbySecondsLeft} seconds* left to join! Type *wrg join* now.\n\n` +
+                    `*${gameState.lobbySecondsLeft} seconds* left to join! Type *wrg join* now.\n` +
+                    `🎯 Mode: ${difficultyBadge(difficulty)}\n\n` +
                     `👥 *Current Lobby:*\n${lobbyText || '[No players yet — be first! 🎯]'}`,
                 mentions: lobbyMentions
             })
@@ -80,12 +91,10 @@ function startLobbyCountdown(chatId, ctx) {
     }, 1000)
 }
 
-/**
- * Transitions from lobby phase to the actual game round.
- */
+// ─── Start actual game ────────────────────────────────────────
 async function startActualGame(chatId, ctx) {
-    const { sock, games, settings, words, activeGameChatRef, persistGames, jidOf } = ctx
-    const gameState = getGameState(chatId, games, settings)
+    const { sock, games, settings, words, activeGameChatRef, persistGames } = ctx
+    const gameState = getGameState(chatId, games)
     gameState.lobbyActive = false
     if (gameState.lobbyTimer) clearInterval(gameState.lobbyTimer)
 
@@ -94,32 +103,35 @@ async function startActualGame(chatId, ctx) {
         activeGameChatRef.value = null
         persistGames()
         return await sock.sendMessage(chatId, {
-            text: `🚫 *Game Cancelled*\nNo one joined the lobby in time. Type *WRG* (all caps) to start a fresh lobby! 🎮`
+            text: `🚫 *Game Cancelled*\nNo one joined the lobby in time. Type *WRG* to start a fresh lobby! 🎮`
         })
     }
 
-    const pool = words[gameState.difficulty] || words.easy
-    gameState.targetWord = pool[Math.floor(Math.random() * pool.length)]
-    gameState.hiddenWord = gameState.targetWord.split('').map(() => '_')
+    // Always read difficulty LIVE from settings at word-pick time
+    const difficulty = settings.difficulty || 'easy'
+    const pool = (words[difficulty] && words[difficulty].length > 0)
+        ? words[difficulty]
+        : DEFAULT_WORDS[difficulty]
 
-    // Initialise a fresh per-player attempts counter for every player in the round
-    gameState.attempts = {}
-    gameState.players.forEach(p => { gameState.attempts[p] = 0 })
-
-    gameState.skipStreaks = {}
-    gameState.disqualified = []
+    gameState.targetWord      = pool[Math.floor(Math.random() * pool.length)]
+    gameState.hiddenWord      = gameState.targetWord.split('').map(() => '_')
+    gameState.attempts        = {}   // reset per-player attempts object
+    gameState.skipStreaks     = {}
+    gameState.disqualified    = []
     gameState.currentTurnIndex = 0
-    gameState.active = true
-    gameState.paused = false
+    gameState.active          = true
+    gameState.paused          = false
 
-    const lobbyMentions = gameState.players.map(num => jidOf(num))
+    const lobbyMentions = gameState.players.map(num => gameState.playerJids[num]).filter(Boolean)
     const lobbyText = gameState.players
-        .map((num, i) => `${i + 1}. @${num} (${gameState.playerNames[num] || num})`)
+        .map((num, i) => `${i + 1}. ${nameTag(num, gameState.playerNames, settings)}`)
         .join('\n')
 
     await sock.sendMessage(chatId, {
         text:
             `🎬 *Lobby Closed — Game On!*\n\n` +
+            `🎯 *Mode:* ${difficultyBadge(difficulty)}\n` +
+            `💥 *Attempts per player:* ${settings.maxTries}\n\n` +
             `👥 *Final Player Lineup:*\n${lobbyText}\n\n` +
             `🏆 May the best guesser win!`,
         mentions: lobbyMentions
@@ -129,61 +141,63 @@ async function startActualGame(chatId, ctx) {
     await sendGameBoard(chatId, '', [], ctx)
 }
 
-/**
- * Sends the game board UI with current word state, player turns, and starts the turn timer.
- * Shows the CURRENT player's personal remaining attempts, not a shared pool.
- */
+// ─── Game board ───────────────────────────────────────────────
 async function sendGameBoard(chatId, actionFeedback = '', extraMentions = [], ctx) {
-    const { sock, games, settings, persistGames, jidOf } = ctx
-    const gameState = getGameState(chatId, games, settings)
+    const { sock, games, settings, persistGames } = ctx
+    const gameState = getGameState(chatId, games)
     if (!gameState.active) return
 
-    const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
-    const currentPlayerJid = jidOf(currentPlayerNumber)
-    const currentPlayerName = gameState.playerNames[currentPlayerNumber] || currentPlayerNumber
+    const difficulty = settings.difficulty || 'easy'
 
-    // Per-player remaining attempts for the current player only
-    const playerAttempts = gameState.attempts[currentPlayerNumber] ?? 0
-    const attemptsLeft = settings.maxTries - playerAttempts
+    const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
+    const currentPlayerJid    = gameState.playerJids[currentPlayerNumber]
+    const currentPlayerName   = nameTag(currentPlayerNumber, gameState.playerNames, settings)
 
     const hasMultiplePlayers = gameState.players.length > 1
-    let nextPlayerNumber = null, nextPlayerJid = null, nextPlayerName = null
+    let nextPlayerName = null, nextPlayerJid = null
+
     if (hasMultiplePlayers) {
-        const nextPlayerIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
-        nextPlayerNumber = gameState.players[nextPlayerIndex]
-        nextPlayerJid = jidOf(nextPlayerNumber)
-        nextPlayerName = gameState.playerNames[nextPlayerNumber] || nextPlayerNumber
+        const nextIndex      = (gameState.currentTurnIndex + 1) % gameState.players.length
+        const nextNumber     = gameState.players[nextIndex]
+        nextPlayerJid        = gameState.playerJids[nextNumber]
+        nextPlayerName       = nameTag(nextNumber, gameState.playerNames, settings)
     }
+
+    const playerAttempts  = gameState.attempts[currentPlayerNumber] || 0
+    const attemptsLeft    = settings.maxTries - playerAttempts
 
     let boardText = ''
     if (actionFeedback) boardText += `${actionFeedback}\n\n`
 
-    boardText += `🎮 *Word Riddle Game (WRG)*\n\n`
+    boardText += `🎮 *Word Riddle Game (WRG)*\n`
+    boardText += `🎯 Mode: ${difficultyBadge(difficulty)}\n\n`
     boardText += `📝 Word: \`${gameState.hiddenWord.join(' ')}\` *(${gameState.targetWord.length} letters)*\n`
-    boardText += `💥 *@${currentPlayerNumber}'s attempts left: ${attemptsLeft}/${settings.maxTries}*\n\n`
-    boardText += `🎯 *Your turn:* @${currentPlayerNumber} (${currentPlayerName})\n`
+    boardText += `💥 *${currentPlayerName}'s attempts left: ${attemptsLeft}/${settings.maxTries}*\n\n`
+    boardText += `🎯 *Your turn:* ${currentPlayerName}\n`
+
     if (hasMultiplePlayers) {
-        boardText += `⏭️ *Up next:* @${nextPlayerNumber} (${nextPlayerName})\n\n`
+        boardText += `⏭️ *Up next:* ${nextPlayerName}\n\n`
     } else {
         boardText += `🕹️ Playing solo — no pressure... just all of it 😄\n\n`
     }
     boardText += `_⏱️ You have 30 seconds — guess a letter or the full word!_`
 
-    const mentionJids = [...new Set([currentPlayerJid, ...(nextPlayerJid ? [nextPlayerJid] : []), ...extraMentions])]
+    const mentionJids = [...new Set([
+        ...(currentPlayerJid ? [currentPlayerJid] : []),
+        ...(nextPlayerJid    ? [nextPlayerJid]    : []),
+        ...extraMentions
+    ])]
+
     await sock.sendMessage(chatId, { text: boardText, mentions: mentionJids })
 
     persistGames()
     startTurnCountdown(chatId, ctx)
 }
 
-/**
- * Starts the 30-second per-turn countdown.
- * Timeouts only count toward skip streaks — they do NOT consume the player's attempt budget.
- * Attempt budget is only reduced by wrong letter/word guesses (handled in index.js).
- */
+// ─── Turn countdown ───────────────────────────────────────────
 function startTurnCountdown(chatId, ctx) {
-    const { sock, games, settings, activeGameChatRef, persistGames, jidOf, tag } = ctx
-    const gameState = getGameState(chatId, games, settings)
+    const { sock, games, settings, activeGameChatRef, persistGames, nameCache } = ctx
+    const gameState = getGameState(chatId, games)
     if (gameState.turnTimer) clearInterval(gameState.turnTimer)
 
     gameState.turnSecondsLeft = 30
@@ -197,84 +211,94 @@ function startTurnCountdown(chatId, ctx) {
         gameState.turnSecondsLeft--
 
         const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
-        const currentPlayerJid = jidOf(currentPlayerNumber)
+        const currentPlayerJid    = gameState.playerJids[currentPlayerNumber]
+        const currentPlayerName   = nameTag(currentPlayerNumber, gameState.playerNames, settings)
 
         if (gameState.turnSecondsLeft <= 0) {
             clearInterval(gameState.turnTimer)
 
-            // Timeout = skip only. Does NOT reduce the player's attempt budget.
+            // Timeout counts as a skip — does NOT use the per-player attempts object
             gameState.skipStreaks[currentPlayerNumber] = (gameState.skipStreaks[currentPlayerNumber] || 0) + 1
-            const skipCount = gameState.skipStreaks[currentPlayerNumber]
+            const skipCount  = gameState.skipStreaks[currentPlayerNumber]
             const removedIndex = gameState.currentTurnIndex
 
             if (skipCount >= 3) {
-                // 3 consecutive no-responses → disqualify this player
+                // 3 consecutive skips — disqualify
                 matchSummary.recordDisqualification(gameState, currentPlayerNumber, matchSummary.DQ_REASONS.SKIPPED_3)
 
-                // Clean up this player's entries from all tracking objects
-                gameState.players.splice(removedIndex, 1)
+                // Clean up player data
+                if (gameState.players.includes(currentPlayerNumber)) {
+                    gameState.players.splice(gameState.players.indexOf(currentPlayerNumber), 1)
+                }
                 delete gameState.playerNames[currentPlayerNumber]
+                delete gameState.playerJids[currentPlayerNumber]
                 delete gameState.skipStreaks[currentPlayerNumber]
                 delete gameState.attempts[currentPlayerNumber]
 
                 const dqText =
                     `🚫 *Disqualified!*\n` +
-                    `${tag(currentPlayerNumber)} skipped *3 turns in a row* without a single guess. They've been removed from the round. 👋`
+                    `*${currentPlayerName}* skipped *3 turns in a row* and has been removed. 👋`
 
-                // Check if someone has won by being last standing
                 const lastStanding = matchSummary.checkLastPlayerStanding(gameState)
                 if (lastStanding) {
                     gameState.active = false
                     activeGameChatRef.value = null
                     await sock.sendMessage(chatId, {
-                        text: `${dqText}\n\n🏆 *LAST PLAYER STANDING!* The word was *${gameState.targetWord.toUpperCase()}*. 🎉`
+                        text:
+                            `${dqText}\n\n` +
+                            `🏆 *LAST PLAYER STANDING!*\n` +
+                            `The word was *${gameState.targetWord.toUpperCase()}*. 🎉`
                     })
-                    await matchSummary.sendMatchReport(sock, chatId, gameState, { type: 'last_standing', winnerNumber: lastStanding }, tag)
+                    await matchSummary.sendMatchReport(sock, chatId, gameState, { type: 'last_standing', winnerNumber: lastStanding }, (n) => nameTag(n, gameState.playerNames, settings))
                     gameState.players = []
                     persistGames()
                     return
                 }
 
-                // No players left at all → game over, no winner
                 if (gameState.players.length === 0) {
                     gameState.active = false
                     activeGameChatRef.value = null
                     await sock.sendMessage(chatId, {
                         text: `${dqText}\n\n💀 *GAME OVER!* No players remain. The word was *${gameState.targetWord.toUpperCase()}*.`
                     })
-                    await matchSummary.sendMatchReport(sock, chatId, gameState, { type: 'no_winner' }, tag)
+                    await matchSummary.sendMatchReport(sock, chatId, gameState, { type: 'no_winner' }, (n) => nameTag(n, gameState.playerNames, settings))
                     persistGames()
                     return
                 }
 
-                // Other players remain — continue the round
                 gameState.currentTurnIndex = removedIndex % gameState.players.length
-                await sendGameBoard(chatId, dqText, [currentPlayerJid], ctx)
+                await sendGameBoard(chatId, dqText, [], ctx)
                 return
             }
 
-            // Normal timeout (under 3 skips) — rotate to next player, no attempt penalty
+            // Normal timeout — rotate turn, no attempts penalty
             const nextTurnIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
             gameState.currentTurnIndex = nextTurnIndex
 
             const feedback =
                 `⏰ *Timeout!*\n` +
-                `${tag(currentPlayerNumber)} took too long to respond. ` +
+                `*${currentPlayerName}* took too long. ` +
                 `(${skipCount}/3 strikes before lockout 🟥)`
 
             await sendGameBoard(chatId, feedback, [], ctx)
 
         } else if (gameState.turnSecondsLeft === 20) {
+            const difficulty = settings.difficulty || 'easy'
             await sock.sendMessage(chatId, {
-                text: `⏱️ *Heads up!* ${tag(currentPlayerNumber)}, you have *20 seconds* left — guess a letter or the full word! 🤔`,
-                mentions: [currentPlayerJid]
+                text:
+                    `⏱️ *${currentPlayerName}, 20 seconds left!* Make your move — ` +
+                    `guess a letter or the full word! 🤔\n` +
+                    `_Mode: ${difficultyBadge(difficulty)}_`,
+                mentions: currentPlayerJid ? [currentPlayerJid] : []
             })
         } else if (gameState.turnSecondsLeft === 10) {
             await sock.sendMessage(chatId, {
-                text: `🚨 *Last 10 seconds!* ${tag(currentPlayerNumber)}, GO GO GO! ⚡`,
-                mentions: [currentPlayerJid]
+                text: `🚨 *${currentPlayerName} — 10 seconds! GO GO GO!* ⚡`,
+                mentions: currentPlayerJid ? [currentPlayerJid] : []
             })
         }
+
+        persistGames()
     }, 1000)
 }
 

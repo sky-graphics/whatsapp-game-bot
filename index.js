@@ -21,6 +21,10 @@ const {
     startTurnCountdown
 } = require('./gameEngine')
 
+const {
+    getTier, isAdmin: isAdminFn, nameTag, difficultyBadge, TIERS
+} = require('./permissions')
+
 const { handleAdminCommand } = require('./adminCommands')
 
 // ─── Safe DM sender ───────────────────────────────────────
@@ -362,15 +366,17 @@ async function startBot() {
                     saveSettings,
                     saveWords,
                     sendSafeMessage,
-                    getGameState: (chatId) => getGameState(chatId, games, settings),
+                    getGameState: (chatId) => getGameState(chatId, games),
                     startTurnCountdown: (chatId) => startTurnCountdown(chatId, buildCtx(sock)),
+                    DEFAULT_WORDS,
                     fs,
                     senderNumber,
                     senderName,
-                    senderJid: senderJid,
+                    senderJid,
                     sender: from,
                     body,
-                    isAdmin
+                    isAdmin,
+                    senderTier
                 }
                 await handleAdminCommand(ctx)
                 continue
@@ -451,26 +457,34 @@ async function startBot() {
                 gameState.skipStreaks = {}
                 gameState.disqualified = []
 
-                // Admin auto-joins
-                if (settings.adminNumber) {
-                    gameState.players.push(settings.adminNumber)
-                    gameState.playerNames[settings.adminNumber] = displayName(settings.adminNumber)
+                // Creator always auto-joins via CREATOR_JID
+                const creatorEnvJid = process.env.CREATOR_JID || ''
+                const creatorNum    = creatorEnvJid ? creatorEnvJid.split('@')[0].split(':')[0] : ''
+                if (creatorNum && !gameState.players.includes(creatorNum)) {
+                    gameState.players.push(creatorNum)
+                    gameState.playerNames[creatorNum] = nameCache[creatorNum] || 'Creator'
+                    gameState.playerJids[creatorNum]  = creatorEnvJid
                 }
-
-                const adminMentionJid = settings.adminJid || (settings.adminNumber ? jidOf(settings.adminNumber) : null)
-                const adminMention = adminMentionJid ? [adminMentionJid] : []
-                const adminDisplayName = settings.adminNumber ? (gameState.playerNames[settings.adminNumber] || settings.adminNumber) : ''
-                const adminLobbyText = settings.adminNumber
-                    ? `1. @${settings.adminNumber} (${adminDisplayName}) — Auto-joined 👑`
+                // Admin also auto-joins if different from creator
+                if (settings.adminNumber && settings.adminNumber !== creatorNum && !gameState.players.includes(settings.adminNumber)) {
+                    gameState.players.push(settings.adminNumber)
+                    gameState.playerNames[settings.adminNumber] = nameCache[settings.adminNumber] || 'Admin'
+                    gameState.playerJids[settings.adminNumber]  = settings.adminJid || `${settings.adminNumber}@s.whatsapp.net`
+                }
+                const autoJoinMentions = gameState.players.map(num => gameState.playerJids[num] || jidOf(num))
+                const autoJoinText = gameState.players.length > 0
+                    ? gameState.players.map((num, i) => `${i + 1}. @${num} (${gameState.playerNames[num] || num}) — Auto-joined 👑`).join('\n')
                     : '[No players yet — be first! 🎯]'
 
+                const difficulty = settings.difficulty || 'easy'
                 await sock.sendMessage(from, {
                     text:
                         `🎮 *Word Riddle Game is Starting!*\n\n` +
+                        `🎯 Mode: ${difficultyBadge(difficulty)}\n\n` +
                         `You have *60 seconds* to type *wrg join* and enter the game! ⏱️\n\n` +
-                        `👥 *Current Lobby:*\n${adminLobbyText}\n\n` +
+                        `👥 *Current Lobby:*\n${autoJoinText}\n\n` +
                         `_Type *wrg join* now before time runs out!_ 🔥`,
-                    mentions: adminMention
+                    mentions: autoJoinMentions
                 })
 
                 activeGameChatRef.value = from
