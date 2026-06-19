@@ -16,36 +16,36 @@ async function sendSafeMessage(sock, phoneNumber, payload) {
     const pnJid = phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`
     let targetJid = null
 
-    console.log([sendSafe] Attempting to send to: ${pnJid})
+    console.log(`[sendSafe] Attempting to send to: ${pnJid}`)
 
     try { 
-        targetJid = await redis.get(lid:${pnJid})
-        console.log([sendSafe] Redis cache result: ${targetJid})
+        targetJid = await redis.get(`lid:${pnJid}`)
+        console.log(`[sendSafe] Redis cache result: ${targetJid}`)
     } catch (err) { 
-        console.log([sendSafe] Redis lookup failed:, err.message) 
+        console.log(`[sendSafe] Redis lookup failed:`, err.message) 
     }
 
     if (!targetJid) {
         try {
             targetJid = await sock.signalRepository?.lidMapping?.getLIDForPN(pnJid)
-            console.log([sendSafe] Baileys LID resolver result: ${targetJid})
+            console.log(`[sendSafe] Baileys LID resolver result: ${targetJid}`)
             if (targetJid) {
-                await redis.set(lid:${pnJid}, targetJid)
-                await redis.set(pn:${targetJid}, pnJid)
+                await redis.set(`lid:${pnJid}`, targetJid)
+                await redis.set(`pn:${targetJid}`, pnJid)
             }
         } catch (err) { 
-            console.log([sendSafe] Baileys LID resolver failed:, err.message) 
+            console.log(`[sendSafe] Baileys LID resolver failed:`, err.message) 
         }
     }
 
     const finalJid = targetJid || pnJid
-    console.log([sendSafe] Final JID used to send: ${finalJid})
+    console.log(`[sendSafe] Final JID used to send: ${finalJid}`)
 
     try {
         const result = await sock.sendMessage(finalJid, payload)
-        console.log([sendSafe] sendMessage resolved:, JSON.stringify(result?.key))
+        console.log(`[sendSafe] sendMessage resolved:`, JSON.stringify(result?.key))
     } catch (err) {
-        console.log([sendSafe] sendMessage threw an error:, err.message)
+        console.log(`[sendSafe] sendMessage threw an error:`, err.message)
     }
 }
 
