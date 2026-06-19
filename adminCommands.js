@@ -14,6 +14,7 @@
 // ============================================================
 
 const crypto = require('crypto')
+const { isCreator: _checkCreator, isAdmin: _checkAdmin } = require('./permissions')
 const {
     TIERS, getTier, isCreator: isCreatorFn, isAdmin: isAdminFn,
     canRunCommand, difficultyBadge, writeSetting, resolveSetting,
@@ -117,16 +118,11 @@ function startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage
     }, 60 * 60 * 1000)  // check every hour
 }
 
-function isCreator(senderNumber) {
-    const creatorJid = process.env.CREATOR_JID
-    if (!creatorJid) return false
-    // Compare phone numbers only. IMPORTANT: senderNumber must already be
-    // PN-format (e.g. derived from msg.key.senderPn), never a raw @lid
-    // identifier — a LID and a PN are different numbering spaces entirely,
-    // so comparing their digits will never match even for the same person.
-    const creatorNum = creatorJid.split('@')[0].split(':')[0]
-    const senderNum  = (senderNumber || '').split('@')[0].split(':')[0]
-    return creatorNum === senderNum
+function isCreator(senderNumber, senderJid) {
+    // Use permissions.js which checks BOTH senderNumber and senderJid.
+    // This handles WhatsApp LID routing where the creator's messages
+    // arrive via a LID instead of their real PN.
+    return _checkCreator(senderNumber, senderJid, {})
 }
 
 // ─── Help dashboard ───────────────────────────────────────────
@@ -200,7 +196,7 @@ async function handleAdminCommand(ctx) {
 
     const creatorJid  = process.env.CREATOR_JID
     const creatorNumber = (creatorJid || '').split('@')[0].split(':')[0]
-    const senderIsCreator = isCreator(senderNumber)
+    const senderIsCreator = isCreator(senderNumber, senderJid)
     const adminJid = settings.adminNumber || settings.adminJid || senderJid
 
     const raw = body.slice(1).trim()
@@ -222,7 +218,7 @@ async function handleAdminCommand(ctx) {
 
         // Creator gets a special identity message
         if (senderIsCreator) {
-            await sendSafeMessage(sock, creatorNumber, {
+            await sendSafeMessage(sock, senderJid, {
                 text:
                     `╔══════════════════════════╗\n` +
                     `   🔐  Sky Graphics Creator\n` +
@@ -546,11 +542,13 @@ async function handleAdminCommand(ctx) {
     // ══════════════════════════════════════════════
     if (cmd[0] === 'help') {
         if (senderIsCreator) {
-            await sendSafeMessage(sock, creatorNumber, { text: buildHelpText(settings, true) })
+            // Creator always gets full dashboard to their own DM
+            await sendSafeMessage(sock, senderJid, { text: buildHelpText(settings, true) })
             return
         }
-        if (isAdmin && settings.adminNumber !== '') {
-            await sendSafeMessage(sock, adminJid, { text: buildHelpText(settings, false) })
+        if (isAdmin) {
+            // Confirmed admin gets dashboard to their own DM
+            await sendSafeMessage(sock, senderJid, { text: buildHelpText(settings, false) })
             return
         }
         // Everyone else — absolute silence
