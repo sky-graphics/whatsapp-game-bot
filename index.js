@@ -13,27 +13,40 @@ redis.on('error', (err) => console.log('⚠️ Redis error:', err.message))
 
 // Safe send: resolves LID from Redis cache first, falls back to Baileys resolver, then raw PN
 async function sendSafeMessage(sock, phoneNumber, payload) {
-    const pnJid = phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`
+    const pnJid = phoneNumber.includes('@') ? phoneNumber : ${phoneNumber}@s.whatsapp.net
     let targetJid = null
 
-    // 1. Check Redis (survives restarts)
-    try {
-        targetJid = await redis.get(`lid:${pnJid}`)
-    } catch (_) {}
+    console.log([sendSafe] Attempting to send to: ${pnJid})
 
-    // 2. Fall back to Baileys in-memory LID resolver
+    try { 
+        targetJid = await redis.get(lid:${pnJid})
+        console.log([sendSafe] Redis cache result: ${targetJid})
+    } catch (err) { 
+        console.log([sendSafe] Redis lookup failed:, err.message) 
+    }
+
     if (!targetJid) {
         try {
             targetJid = await sock.signalRepository?.lidMapping?.getLIDForPN(pnJid)
+            console.log([sendSafe] Baileys LID resolver result: ${targetJid})
             if (targetJid) {
-                await redis.set(`lid:${pnJid}`, targetJid)
-                await redis.set(`pn:${targetJid}`, pnJid)
+                await redis.set(lid:${pnJid}, targetJid)
+                await redis.set(pn:${targetJid}, pnJid)
             }
-        } catch (_) {}
+        } catch (err) { 
+            console.log([sendSafe] Baileys LID resolver failed:, err.message) 
+        }
     }
 
-    // 3. Last resort — raw PN JID
-    return await sock.sendMessage(targetJid || pnJid, payload)
+    const finalJid = targetJid || pnJid
+    console.log([sendSafe] Final JID used to send: ${finalJid})
+
+    try {
+        const result = await sock.sendMessage(finalJid, payload)
+        console.log([sendSafe] sendMessage resolved:, JSON.stringify(result?.key))
+    } catch (err) {
+        console.log([sendSafe] sendMessage threw an error:, err.message)
+    }
 }
 
 // Persistent Settings Structure
