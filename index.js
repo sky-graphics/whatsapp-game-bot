@@ -318,9 +318,6 @@ async function startBot() {
                 clearInterval(gameState.lobbyTimer)
                 await startActualGame(chatId)
             }
-            else if (gameState.lobbySecondsLeft === 5) {
-                await sock.sendMessage(chatId, { text: `*⚠️ Warning:* Only *5 seconds* left to join the game!` })
-            }
             else if (gameState.lobbySecondsLeft % 10 === 0) {
                 const lobbyMentions = gameState.players.map(num => jidOf(num))
                 const lobbyText = gameState.players.map((num, i) => `${i + 1}. ${tag(num)}`).join('\n')
@@ -488,12 +485,6 @@ async function startBot() {
                     await sendGameBoard(chatId, feedback)
                 }
             }
-            else if (gameState.turnSecondsLeft === 5) {
-                await sock.sendMessage(chatId, {
-                    text: `*⚠️ Turn Warning:*\n${tag(currentPlayerNumber)}, only *5 seconds* left! Hurry!`,
-                    mentions: [currentPlayerJid]
-                })
-            }
             else if (gameState.turnSecondsLeft === 10) {
                 await sock.sendMessage(chatId, {
                     text: `*⏱️ Turn Alert:*\n${tag(currentPlayerNumber)}, you have *10 seconds* remaining to guess a letter or the word!`,
@@ -554,10 +545,12 @@ async function startBot() {
 
             // Extract sender JID and phone number
             // NOTE: Baileys sometimes appends a device suffix (e.g. "237xxxxxxxxx:14@s.whatsapp.net").
-            // Splitting only on "@" left that ":14" stuck to the number, which is why the number
-            // looked "wrong" / different from what shows on WhatsApp. We strip it here.
+            // When a message arrives from a private chat, remoteJid is the sender's @lid JID —
+            // NOT their phone number. We must use senderPn when available to always get the real PN.
             const sender = msg.key.participant || msg.key.remoteJid || ''
-            const senderNumber = sender.split('@')[0].split(':')[0]
+            const senderNumber = msg.key.senderPn
+                ? msg.key.senderPn.split('@')[0].split(':')[0]
+                : sender.split('@')[0].split(':')[0]
 
             // The real name set on the sender's WhatsApp profile (what WhatsApp calls "pushName").
             // This is the only reliable source for "the exact name the person uses on WhatsApp" —
@@ -844,7 +837,37 @@ async function startBot() {
             }
 
             // --- LOBBY START AUTOMATION ---
-            if (rawBody === 'WRG') {
+            // WRG (all caps) = start a game. Any other casing (Wrg, wrG, etc) = show bot intro + help.
+            const isAllCapsWRG = rawBody === 'WRG'
+            const isMixedWRG = !isAllCapsWRG && rawBody.toUpperCase() === 'WRG'
+
+            if (isMixedWRG) {
+                // Show ping + bot intro + game instructions
+                const pingStart = Date.now()
+                const pingMsg = await sock.sendMessage(from, { text: '🏓 Pong!' })
+                const pingMs = Date.now() - pingStart
+
+                await sock.sendMessage(from, {
+                    text: `🤖 *WRG Bot* | Response time: *${pingMs}ms*\n\n` +
+                        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+                        `🎮 *Word Riddle Game Bot*\n` +
+                        `━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+                        `Hello! I'm the *WRG Bot*, a multiplayer word guessing game for WhatsApp groups.\n\n` +
+                        `Take turns guessing letters to reveal a hidden word before the attempts run out. Miss 3 turns in a row and you're out!\n\n` +
+                        `_Created with ❤️ by_ *_Sky Graphics_*\n\n` +
+                        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+                        `*🎮 How to Play:*\n\n` +
+                        `1️⃣ Type *WRG* (all caps) to open a game lobby\n` +
+                        `2️⃣ Type *wrg join* to enter the lobby\n` +
+                        `3️⃣ Lobby closes after 60 seconds — game begins automatically!\n` +
+                        `4️⃣ On your turn, type a *single letter* to guess, or the *full word* to win instantly\n` +
+                        `5️⃣ Miss *3 turns in a row* and you're disqualified\n` +
+                        `6️⃣ Last player standing wins! 🏆`
+                })
+                continue
+            }
+
+            if (isAllCapsWRG) {
                 if (!isAdmin && !settings.publicStart) {
                     continue
                 }
