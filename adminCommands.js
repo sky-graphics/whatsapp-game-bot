@@ -25,8 +25,8 @@ const pendingKeys = {}
 const approvalQueue = {}
 
 function generateKey() {
-    // 8 hex chars = 4 random bytes = 16^8 = 4 billion combinations
-    return crypto.randomBytes(4).toString('hex').toUpperCase()
+    // Standard UUID v4 — globally unique, not just "large enough to guess"
+    return crypto.randomUUID()
 }
 
 function cleanExpiredKeys() {
@@ -40,12 +40,15 @@ function cleanExpiredKeys() {
     }
 }
 
-function isCreator(jid) {
+function isCreator(senderNumber) {
     const creatorJid = process.env.CREATOR_JID
     if (!creatorJid) return false
-    // Match on the number portion only — tolerates :device suffixes
+    // Compare phone numbers only. IMPORTANT: senderNumber must already be
+    // PN-format (e.g. derived from msg.key.senderPn), never a raw @lid
+    // identifier — a LID and a PN are different numbering spaces entirely,
+    // so comparing their digits will never match even for the same person.
     const creatorNum = creatorJid.split('@')[0].split(':')[0]
-    const senderNum  = (jid || '').split('@')[0].split(':')[0]
+    const senderNum  = (senderNumber || '').split('@')[0].split(':')[0]
     return creatorNum === senderNum
 }
 
@@ -117,7 +120,18 @@ async function handleAdminCommand(ctx) {
     } = ctx
 
     const creatorJid  = process.env.CREATOR_JID
-    const senderIsCreator = isCreator(senderJid)
+    // Bare number, not a JID — sendSafeMessage() normalizes this into a
+    // sendable JID itself. No mapping/cache needed: by the time the bot
+    // replies to the creator, a session already exists (they just messaged
+    // it), so WhatsApp routes a plain number@s.whatsapp.net JID correctly.
+    const creatorNumber = (creatorJid || '').split('@')[0].split(':')[0]
+    // FIX: must compare against senderNumber (phone-number format, already
+    // resolved by Baileys via msg.key.senderPn) — NOT senderJid, which is
+    // frequently a @lid identifier. A LID's digits and a PN's digits are
+    // different numbering spaces; comparing them never matches, even for
+    // the creator's own messages. This was the root cause of the creator
+    // never being recognized as creator.
+    const senderIsCreator = isCreator(senderNumber)
     const adminJid = settings.adminJid || (settings.adminNumber ? jidOf(settings.adminNumber) : senderJid)
 
     const raw = body.slice(1).trim()
@@ -130,7 +144,7 @@ async function handleAdminCommand(ctx) {
 
         // Creator gets a special identity message
         if (senderIsCreator) {
-            await sendSafeMessage(sock, creatorJid, {
+            await sendSafeMessage(sock, creatorNumber, {
                 text:
                     `╔══════════════════════════╗\n` +
                     `   🔐  Sky Graphics Creator\n` +
@@ -184,7 +198,7 @@ async function handleAdminCommand(ctx) {
                 return
             }
 
-            if (input.toUpperCase() !== session.key) {
+            if (input.toLowerCase() !== session.key.toLowerCase()) {
                 // Wrong key — log attempt but give nothing away
                 console.warn(`[SECURITY] Wrong key attempt from ${senderNumber} (JID: ${senderJid})`)
                 await sendSafeMessage(sock, senderJid, {
@@ -224,7 +238,7 @@ async function handleAdminCommand(ctx) {
             // Notify creator silently
             if (creatorJid) {
                 try {
-                    await sendSafeMessage(sock, creatorJid, {
+                    await sendSafeMessage(sock, creatorNumber, {
                         text:
                             `✅ *Admin Registration Complete*\n\n` +
                             `👤 Name: *${approvedSession.senderName || 'Unknown'}*\n` +
@@ -266,7 +280,7 @@ async function handleAdminCommand(ctx) {
         // Alert creator with full detail + approval options
         if (creatorJid) {
             try {
-                await sendSafeMessage(sock, creatorJid, {
+                await sendSafeMessage(sock, creatorNumber, {
                     text:
                         `╔══════════════════════════╗\n` +
                         `   🔔  Admin Access Request\n` +
@@ -302,7 +316,7 @@ async function handleAdminCommand(ctx) {
 
         const targetNumber = (cmd[1] || '').replace(/[^0-9]/g, '')
         if (!targetNumber) {
-            await sendSafeMessage(sock, creatorJid, {
+            await sendSafeMessage(sock, creatorNumber, {
                 text: `⚠️ Usage: \`/approve [number]\``
             })
             return
@@ -310,7 +324,7 @@ async function handleAdminCommand(ctx) {
 
         const targetJid = approvalQueue[targetNumber]
         if (!targetJid || !pendingKeys[targetJid]) {
-            await sendSafeMessage(sock, creatorJid, {
+            await sendSafeMessage(sock, creatorNumber, {
                 text:
                     `⚠️ *No active request found for* \`${targetNumber}\`\n\n` +
                     `The session may have already expired or been denied.`
@@ -323,7 +337,7 @@ async function handleAdminCommand(ctx) {
         if (Date.now() > session.expiresAt) {
             delete pendingKeys[targetJid]
             delete approvalQueue[targetNumber]
-            await sendSafeMessage(sock, creatorJid, {
+            await sendSafeMessage(sock, creatorNumber, {
                 text: `⏰ *Too late* — the session for \`${targetNumber}\` already expired.`
             })
             return
@@ -348,13 +362,13 @@ async function handleAdminCommand(ctx) {
                     `_WRG Bot · Sky Graphics_ 🎨`
             })
 
-            await sendSafeMessage(sock, creatorJid, {
+            await sendSafeMessage(sock, creatorNumber, {
                 text:
                     `✅ *Key delivered to* \`${targetNumber}\`\n\n` +
                     `They now have until the 10-minute window closes to activate. ⏱️`
             })
         } catch (err) {
-            await sendSafeMessage(sock, creatorJid, {
+            await sendSafeMessage(sock, creatorNumber, {
                 text: `⚠️ *Could not deliver key to* \`${targetNumber}\`: ${err.message}`
             })
         }
@@ -369,7 +383,7 @@ async function handleAdminCommand(ctx) {
 
         const targetNumber = (cmd[1] || '').replace(/[^0-9]/g, '')
         if (!targetNumber) {
-            await sendSafeMessage(sock, creatorJid, {
+            await sendSafeMessage(sock, creatorNumber, {
                 text: `⚠️ Usage: \`/deny [number]\``
             })
             return
@@ -377,7 +391,7 @@ async function handleAdminCommand(ctx) {
 
         const targetJid = approvalQueue[targetNumber]
         if (!targetJid || !pendingKeys[targetJid]) {
-            await sendSafeMessage(sock, creatorJid, {
+            await sendSafeMessage(sock, creatorNumber, {
                 text:
                     `⚠️ *No active request found for* \`${targetNumber}\`\n\n` +
                     `Already expired, approved, or never requested.`
@@ -401,7 +415,7 @@ async function handleAdminCommand(ctx) {
             })
         } catch (_) {}
 
-        await sendSafeMessage(sock, creatorJid, {
+        await sendSafeMessage(sock, creatorNumber, {
             text:
                 `🚫 *Request denied and key voided.*\n\n` +
                 `\`${targetNumber}\` has been notified without details. 🔒`
@@ -415,7 +429,7 @@ async function handleAdminCommand(ctx) {
     // ══════════════════════════════════════════════
     if (cmd[0] === 'help') {
         if (senderIsCreator) {
-            await sendSafeMessage(sock, creatorJid, { text: buildHelpText(settings, true) })
+            await sendSafeMessage(sock, creatorNumber, { text: buildHelpText(settings, true) })
             return
         }
         if (isAdmin && settings.adminNumber !== '') {
@@ -432,7 +446,7 @@ async function handleAdminCommand(ctx) {
     if (!senderIsCreator && !isAdmin) return
 
     // Determine reply target
-    const replyTo = senderIsCreator ? creatorJid : adminJid
+    const replyTo = senderIsCreator ? creatorNumber : adminJid
 
     // ─── /set difficulty ─────────────────────────
     if (cmd[0] === 'set' && cmd[1] === 'difficulty') {

@@ -1,6 +1,6 @@
 // ============================================================
 //  index.js — WRG Bot · Sky Graphics
-//  Thin orchestrator: Redis, connection, message routing.
+//  Thin orchestrator: connection, message routing.
 //  Game logic  → gameEngine.js
 //  Admin logic → adminCommands.js
 // ============================================================
@@ -10,7 +10,6 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = requi
 const { Boom } = require('@hapi/boom')
 const qrcode = require('qrcode-terminal')
 const fs = require('fs')
-const Redis = require('ioredis')
 const matchSummary = require('./matchSummary')
 
 const {
@@ -24,57 +23,21 @@ const {
 
 const { handleAdminCommand } = require('./adminCommands')
 
-// ─── Redis ────────────────────────────────────────────────
-const redis = new Redis(process.env.REDIS_URL)
-redis.on('connect', () => console.log('✅ Redis connected'))
-redis.on('error', (err) => console.log('⚠️ Redis error:', err.message))
-
-// ─── Safe DM sender (handles LID ↔ PN resolution) ────────
+// ─── Safe DM sender ───────────────────────────────────────
+// WhatsApp lets you message a contact using EITHER their LID or their
+// phone-number JID once a session exists between you (which is always
+// true here — the creator/admin/requester has already messaged the bot
+// before the bot ever needs to reply). No mapping table, no cache, no
+// external store required — just normalize a bare number into a JID
+// and send. If a live JID was already captured from an inbound message,
+// pass that straight through unchanged.
 async function sendSafeMessage(sock, jidOrNumber, payload) {
-    if (jidOrNumber.includes('@')) {
-        console.log(`[sendSafe] Direct JID send to: ${jidOrNumber}`)
-        try {
-            const result = await sock.sendMessage(jidOrNumber, payload)
-            console.log(`[sendSafe] Sent OK:`, JSON.stringify(result?.key))
-        } catch (err) {
-            console.log(`[sendSafe] Direct send error:`, err.message)
-        }
-        return
-    }
-
-    const pnJid = `${jidOrNumber}@s.whatsapp.net`
-    let targetJid = null
-
-    console.log(`[sendSafe] Attempting PN→LID resolution for: ${pnJid}`)
-
+    const targetJid = jidOrNumber.includes('@') ? jidOrNumber : `${jidOrNumber}@s.whatsapp.net`
     try {
-        targetJid = await redis.get(`lid:${pnJid}`)
-        console.log(`[sendSafe] Redis cache result: ${targetJid}`)
+        const result = await sock.sendMessage(targetJid, payload)
+        console.log(`[sendSafe] Sent to ${targetJid}:`, JSON.stringify(result?.key))
     } catch (err) {
-        console.log(`[sendSafe] Redis lookup failed:`, err.message)
-    }
-
-    if (!targetJid) {
-        try {
-            targetJid = await sock.signalRepository?.lidMapping?.getLIDForPN(pnJid)
-            console.log(`[sendSafe] Baileys LID resolver result: ${targetJid}`)
-            if (targetJid) {
-                await redis.set(`lid:${pnJid}`, targetJid)
-                await redis.set(`pn:${targetJid}`, pnJid)
-            }
-        } catch (err) {
-            console.log(`[sendSafe] Baileys LID resolver failed:`, err.message)
-        }
-    }
-
-    const finalJid = targetJid || pnJid
-    console.log(`[sendSafe] Final JID used to send: ${finalJid}`)
-
-    try {
-        const result = await sock.sendMessage(finalJid, payload)
-        console.log(`[sendSafe] sendMessage resolved:`, JSON.stringify(result?.key))
-    } catch (err) {
-        console.log(`[sendSafe] sendMessage threw an error:`, err.message)
+        console.log(`[sendSafe] Send error to ${targetJid}:`, err.message)
     }
 }
 
@@ -135,6 +98,26 @@ function tag(number) {
 
 function jidOf(number) {
     return `${number}@s.whatsapp.net`
+}
+
+// ─── Idempotency guard (in-memory — no external store needed) ──
+// During WhatsApp's LID migration, the same message can occasionally
+// arrive as two separate 'notify' events. This keeps a short-lived record
+// of message IDs already handled so a single typed command can't trigger
+// a command twice. Self-cleaning, bounded by the time window — not a
+// persistent store, just a few minutes of recent message IDs in memory.
+const recentlySeenIds = new Map() // msgId → timestamp
+const DEDUP_WINDOW_MS = 2 * 60 * 1000
+
+function isDuplicateMessage(msgId) {
+    if (!msgId) return false
+    const now = Date.now()
+    for (const [id, ts] of recentlySeenIds) {
+        if (now - ts > DEDUP_WINDOW_MS) recentlySeenIds.delete(id)
+    }
+    if (recentlySeenIds.has(msgId)) return true
+    recentlySeenIds.set(msgId, now)
+    return false
 }
 
 // ─── Word Pools ────────────────────────────────────────────
@@ -235,21 +218,6 @@ async function startBot() {
         if (connection === 'open') {
             console.log('✅ WRG Bot is connected! 🎮')
 
-            // Seed own LID mapping
-            try {
-                const ownJid = sock.user?.id
-                const ownLid = sock.user?.lid
-                const ownPn = (ownJid || '').split(':')[0].split('@')[0]
-                if (ownLid && ownPn) {
-                    const pnJid = `${ownPn}@s.whatsapp.net`
-                    await redis.set(`lid:${pnJid}`, ownLid)
-                    await redis.set(`pn:${ownLid}`, pnJid)
-                    console.log(`[boot] Seeded own LID mapping: ${pnJid} → ${ownLid}`)
-                }
-            } catch (err) {
-                console.log('[boot] Could not seed own LID:', err.message)
-            }
-
             // Boot confirmation DM to admin (once per process)
             if (!hasSentBootAdminConfirmation) {
                 hasSentBootAdminConfirmation = true
@@ -302,28 +270,11 @@ async function startBot() {
         for (const msg of messages) {
             if (!msg.message) continue
 
-            // Auto-seed LID mapping from every incoming message
-            const senderJid = msg.key.participant || msg.key.remoteJid
-            const pnJid = msg.key.senderPn
-                ? (msg.key.senderPn.includes('@') ? msg.key.senderPn : `${msg.key.senderPn}@s.whatsapp.net`)
-                : null
-
-            if (senderJid?.includes('@lid') && pnJid) {
-                const existing = await redis.get(`pn:${senderJid}`).catch(() => null)
-                if (!existing) {
-                    await redis.set(`lid:${pnJid}`, senderJid).catch(() => {})
-                    await redis.set(`pn:${senderJid}`, pnJid).catch(() => {})
-                    console.log(`📌 Auto-seeded LID mapping: ${pnJid} ↔ ${senderJid}`)
-                }
-            }
-
-            const incomingLid = msg.key.remoteJid
-            const incomingPn = msg.key.senderPn
-            if (incomingLid && incomingPn && incomingLid.endsWith('@lid')) {
-                try {
-                    await redis.set(`lid:${incomingPn}`, incomingLid)
-                    await redis.set(`pn:${incomingLid}`, incomingPn)
-                } catch (_) {}
+            // Skip if this exact message was already processed (see
+            // isDuplicateMessage above)
+            if (isDuplicateMessage(msg.key?.id)) {
+                console.log(`[dedup] Skipping duplicate delivery of message: ${msg.key.id}`)
+                continue
             }
 
             const from = msg.key.remoteJid
