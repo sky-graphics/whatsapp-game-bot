@@ -234,6 +234,22 @@ async function startBot() {
         if (connection === 'open') {
             console.log('✅ WRG Bot is connected!')
 
+            // Seed own LID mapping immediately on connect
+            try {
+                const ownJid = sock.user?.id  // e.g. 237xxxxxxx:14@s.whatsapp.net
+                const ownLid = sock.user?.lid  // e.g. 12345@lid
+                const ownPn = (ownJid || '').split(':')[0].split('@')[0]
+                console.log(`[boot] own JID: ${ownJid}, own LID: ${ownLid}, own PN: ${ownPn}`)
+                if (ownLid && ownPn) {
+                    const pnJid = `${ownPn}@s.whatsapp.net`
+                    await redis.set(`lid:${pnJid}`, ownLid)
+                    await redis.set(`pn:${ownLid}`, pnJid)
+                    console.log(`[boot] Seeded own LID mapping: ${pnJid} → ${ownLid}`)
+                }
+            } catch (err) {
+                console.log('[boot] Could not seed own LID:', err.message)
+            }
+
             // IMPROVEMENT 7: re-confirm admin status to the saved admin's DM every time
             // the bot (re)connects — covers Railway redeploys, crash restarts, manual
             // restarts, etc. This is intentionally separate from the one-time
