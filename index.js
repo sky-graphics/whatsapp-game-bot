@@ -13,7 +13,7 @@ redis.on('error', (err) => console.log('⚠️ Redis error:', err.message))
 
 // Safe send: resolves LID from Redis cache first, falls back to Baileys resolver, then raw PN
 async function sendSafeMessage(sock, phoneNumber, payload) {
-    const pnJid = phoneNumber.includes('@') ? phoneNumber : ${phoneNumber}@s.whatsapp.net
+    const pnJid = phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`
     let targetJid = null
 
     console.log([sendSafe] Attempting to send to: ${pnJid})
