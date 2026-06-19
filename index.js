@@ -97,7 +97,17 @@ function tag(number) {
 }
 
 function jidOf(number) {
+    if (!number) return ''
+    if (number.includes('@')) return number
     return `${number}@s.whatsapp.net`
+}
+
+// Resolve the correct full JID for mentions — uses stored playerJids map first
+// so LID players get @lid JID not @s.whatsapp.net
+function resolveJid(number, playerJids) {
+    if (!number) return ''
+    if (number.includes('@')) return number
+    return (playerJids && playerJids[number]) || `${number}@s.whatsapp.net`
 }
 
 // ─── Idempotency guard (in-memory — no external store needed) ──
@@ -408,11 +418,27 @@ async function startBot() {
                 }
 
                 if (activeGameChatRef.value) {
-                    await sock.sendMessage(from, {
-                        text: activeGameChatRef.value === from
-                            ? `⚠️ A game or lobby is *already active in this chat!* ⏳`
-                            : `⚠️ A game is currently running in another chat. It must end before a new one can start.`
-                    })
+                    if (activeGameChatRef.value === from) {
+                        await sock.sendMessage(from, {
+                            text: `⚠️ A game or lobby is *already active in this chat!* ⏳`
+                        })
+                    } else {
+                        await sock.sendMessage(from, {
+                            text: `⚠️ A game is currently running in another chat. It must end before a new one can start.`
+                        })
+                        // DM admin so they're aware (item 9)
+                        const adminTarget = settings.adminJid || settings.adminNumber
+                        if (adminTarget) {
+                            try {
+                                await sendSafeMessage(sock, adminTarget, {
+                                    text:
+                                        `⚠️ *Duplicate Game Attempt*\n\n` +
+                                        `Someone tried to start a game in *${from}* while a game is already active in *${activeGameChatRef.value}*.\n\n` +
+                                        `Use */end* to stop the current game if needed. 🎮`
+                                })
+                            } catch (_) {}
+                        }
+                    }
                     continue
                 }
 
@@ -421,6 +447,7 @@ async function startBot() {
                 gameState.lobbySecondsLeft = 60
                 gameState.players = []
                 gameState.playerNames = {}
+                gameState.playerJids = {}
                 gameState.skipStreaks = {}
                 gameState.disqualified = []
 
@@ -468,10 +495,11 @@ async function startBot() {
                     if (!gameState.players.includes(senderNumber)) {
                         gameState.players.push(senderNumber)
                         gameState.playerNames[senderNumber] = senderName
+                        gameState.playerJids[senderNumber] = senderJid
 
-                        const lobbyMentions = gameState.players.map(num => jidOf(num))
+                        const lobbyMentions = gameState.players.map(num => resolveJid(num, gameState.playerJids))
                         const lobbyText = gameState.players
-                            .map((num, i) => `${i + 1}. @${num} (${gameState.playerNames[num] || num})`)
+                            .map((num, i) => `${i + 1}. @${displayName(num)} (${gameState.playerNames[num] || num})`)
                             .join('\n')
 
                         await sock.sendMessage(from, {
@@ -479,7 +507,7 @@ async function startBot() {
                                 `✅ *@${senderNumber} (${senderName}) joined the lobby!* 🎉\n\n` +
                                 `👥 *Current Lobby:*\n${lobbyText}\n\n` +
                                 `_Type *wrg join* to hop in!_ ⏱️`,
-                            mentions: [...new Set([jidOf(senderNumber), ...lobbyMentions])]
+                            mentions: [...new Set([resolveJid(senderNumber, gameState.playerJids), ...lobbyMentions])]
                         })
                         persistGames()
                     } else {
@@ -562,7 +590,7 @@ async function startBot() {
                                 const feedback =
                                     `✅ *Correct!*\n` +
                                     `${tag(senderNumber)} guessed *${body.toUpperCase()}* and revealed the first occurrence! 🟢`
-                                await sendGameBoard(from, feedback, [jidOf(senderNumber)], buildCtx(sock))
+                                await sendGameBoard(from, feedback, [resolveJid(senderNumber, gameState.playerJids)], buildCtx(sock))
                             }
                         } else {
                             // Wrong letter

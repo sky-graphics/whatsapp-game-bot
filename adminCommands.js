@@ -16,13 +16,23 @@
 const crypto = require('crypto')
 
 // ─── Pending key sessions ────────────────────────────────────
-// Map: senderJid → { key, expiresAt, senderNumber, senderName }
+// Map: senderJid → { key, expiresAt, senderNumber, senderName, attempts }
 // Keys are ALWAYS bound to the exact JID that requested them.
 const pendingKeys = {}
 
 // ─── Pending approval queue ──────────────────────────────────
 // Map: senderNumber → senderJid  (so creator can /approve by number)
 const approvalQueue = {}
+
+// ─── Rate limiting: /admin spam lockout ──────────────────────
+// Map: senderNumber → { count, lockedUntil }
+// 5 /admin presses → 10-minute silent lockout
+const adminRateLimit = {}
+
+// ─── Admin inactivity tracker ────────────────────────────────
+// Tracks the last time admin ran any command. Auto-clears slot after 30 days.
+let adminLastActive = 0          // epoch ms — set on every admin command
+let adminInactivityTimer = null  // single global interval
 
 function generateKey() {
     // Standard UUID v4 — globally unique, not just "large enough to guess"
@@ -38,6 +48,68 @@ function cleanExpiredKeys() {
             delete approvalQueue[num]
         }
     }
+}
+
+// Returns true if this senderNumber is currently rate-limited.
+// Increments counter; locks out at 5 hits within any window.
+function checkAdminRateLimit(senderNumber) {
+    const now = Date.now()
+    const entry = adminRateLimit[senderNumber] || { count: 0, lockedUntil: 0 }
+
+    if (now < entry.lockedUntil) return true  // still locked
+
+    // Reset count if lockout has expired
+    if (entry.lockedUntil && now >= entry.lockedUntil) {
+        entry.count = 0
+        entry.lockedUntil = 0
+    }
+
+    entry.count++
+    if (entry.count >= 5) {
+        entry.lockedUntil = now + 10 * 60 * 1000  // 10-minute lockout
+        entry.count = 0
+    }
+    adminRateLimit[senderNumber] = entry
+    return false
+}
+
+// Start (or restart) the 30-day admin inactivity watchdog.
+// If the admin slot goes 30 days with no command, it auto-clears.
+function startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage) {
+    if (adminInactivityTimer) clearInterval(adminInactivityTimer)
+    adminLastActive = Date.now()
+
+    adminInactivityTimer = setInterval(async () => {
+        if (!settings.adminNumber) {
+            clearInterval(adminInactivityTimer)
+            adminInactivityTimer = null
+            return
+        }
+        const thirtyDays = 30 * 24 * 60 * 60 * 1000
+        if (Date.now() - adminLastActive >= thirtyDays) {
+            clearInterval(adminInactivityTimer)
+            adminInactivityTimer = null
+
+            const cleared = settings.adminNumber
+            settings.adminNumber = ''
+            settings.adminJid    = ''
+            saveSettings()
+
+            const creatorJid    = process.env.CREATOR_JID
+            const creatorNumber = (creatorJid || '').split('@')[0].split(':')[0]
+            if (creatorNumber) {
+                try {
+                    await sendSafeMessage(sock, creatorNumber, {
+                        text:
+                            `⚠️ *Admin Slot Auto-Cleared*\n\n` +
+                            `${cleared} has been inactive for *30 days* — the admin slot has been reset.\n\n` +
+                            `The bot is now unconfigured. The next */admin* request will begin fresh onboarding. 🚀`
+                    })
+                } catch (_) {}
+            }
+            console.log(`[inactivity] Admin slot cleared — ${cleared} inactive for 30 days.`)
+        }
+    }, 60 * 60 * 1000)  // check every hour
 }
 
 function isCreator(senderNumber) {
@@ -66,28 +138,30 @@ function buildHelpText(settings, forCreator = false) {
         `_Sky Graphics — Word Riddle Game_\n\n` +
         `All commands work from *any chat*.\n` +
         `Every reply comes to *your DM only*.\n\n` +
+        `Reply with *1*, *2*, or *3* for a category — or just use any command directly:\n\n` +
 
-        `*⚙️ Settings:*\n` +
+        `*1️⃣ Settings*\n` +
         `› \`/set difficulty [easy/normal/difficult]\`\n` +
-        `› \`/set admin [number]\` — change admin (requires /confirm)\n` +
-        `› \`/confirm\` · \`/cancel\`\n` +
+        `› \`/set admin [number]\` → \`/confirm\` · \`/cancel\`\n` +
         `› \`/set public [on/off]\` — non-admin visibility\n` +
         `› \`/set start [on/off]\` — public lobby start\n` +
-        `› \`/set maxtries [n]\` — attempt budget\n\n` +
+        `› \`/set maxtries [n]\` — attempt budget\n` +
+        `› \`/clearadmin\` — clear admin slot only (keeps pools)\n` +
+        `› \`/reset\` — ⚠️ wipe ALL data\n\n` +
 
-        `*📚 Word Pools:*\n` +
+        `*2️⃣ Word Pools*\n` +
         `› \`/addword [level] [word]\`\n` +
         `› \`/removeword [level] [word]\`\n` +
         `› \`/listwords [level]\`\n` +
         `› \`/setwords [level] w1 w2 ...\` — replace pool\n` +
-        `› \`/clearwords [level]\`\n` +
+        `› \`/clearwords [level]\` — cannot empty last pool\n` +
         `› \`/setallwords easy:w1,w2 normal:w3 difficult:w4\`\n\n` +
 
-        `*🎮 Game Controls:*\n` +
+        `*3️⃣ Game Controls*\n` +
+        `› \`/status\` — live game state in your DM\n` +
         `› \`/pause\` — freeze turn timer\n` +
         `› \`/resume\` — unfreeze\n` +
-        `› \`/end\` · \`/stop\` — kill active game\n` +
-        `› \`/reset\` — ⚠️ wipe ALL data\n\n` +
+        `› \`/end\` · \`/stop\` — kill active game\n\n` +
 
         (forCreator
             ? `*🔐 Creator-Only:*\n` +
@@ -120,22 +194,21 @@ async function handleAdminCommand(ctx) {
     } = ctx
 
     const creatorJid  = process.env.CREATOR_JID
-    // Bare number, not a JID — sendSafeMessage() normalizes this into a
-    // sendable JID itself. No mapping/cache needed: by the time the bot
-    // replies to the creator, a session already exists (they just messaged
-    // it), so WhatsApp routes a plain number@s.whatsapp.net JID correctly.
     const creatorNumber = (creatorJid || '').split('@')[0].split(':')[0]
-    // FIX: must compare against senderNumber (phone-number format, already
-    // resolved by Baileys via msg.key.senderPn) — NOT senderJid, which is
-    // frequently a @lid identifier. A LID's digits and a PN's digits are
-    // different numbering spaces; comparing them never matches, even for
-    // the creator's own messages. This was the root cause of the creator
-    // never being recognized as creator.
     const senderIsCreator = isCreator(senderNumber)
-    const adminJid = settings.adminJid || (settings.adminNumber ? jidOf(settings.adminNumber) : senderJid)
+    const adminJid = settings.adminNumber || settings.adminJid || senderJid
 
     const raw = body.slice(1).trim()
     const cmd = raw.split(' ')
+
+    // Bump inactivity clock on every admin/creator command
+    if (senderIsCreator || isAdmin) {
+        adminLastActive = Date.now()
+        // Start the watchdog if admin is set and timer isn't running
+        if (settings.adminNumber && !adminInactivityTimer) {
+            startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
+        }
+    }
 
     // ══════════════════════════════════════════════
     //  /admin
@@ -165,14 +238,26 @@ async function handleAdminCommand(ctx) {
             return
         }
 
-        // Admin already set → total silence for non-admins
-        if (settings.adminNumber !== '' && !isAdmin) return
+        // Admin already set → subtle generic reply for non-admins (item 6)
+        if (settings.adminNumber !== '' && !isAdmin) {
+            // Rate-limit check first
+            if (checkAdminRateLimit(senderNumber)) return  // locked out — total silence
+
+            await sendSafeMessage(sock, senderJid, {
+                text: `ℹ️ This bot is already configured. Contact the group admin for assistance.`
+            })
+            return
+        }
 
         // ── First-time onboarding ──────────────────
         const input = cmd.slice(1).join(' ').trim()
 
         if (input) {
             // Person is submitting a key
+
+            // Rate-limit check
+            if (checkAdminRateLimit(senderNumber)) return
+
             const session = pendingKeys[senderJid]
 
             if (!session) {
@@ -199,15 +284,36 @@ async function handleAdminCommand(ctx) {
             }
 
             if (input.toLowerCase() !== session.key.toLowerCase()) {
-                // Wrong key — log attempt but give nothing away
-                console.warn(`[SECURITY] Wrong key attempt from ${senderNumber} (JID: ${senderJid})`)
-                await sendSafeMessage(sock, senderJid, {
-                    text:
-                        `❌ *Invalid Key*\n\n` +
-                        `The key you entered is incorrect.\n\n` +
-                        `Double-check the key provided by the *Sky Graphics* team and try again.\n` +
-                        `Type \`/admin [yourkey]\` to retry. 🔑`
-                })
+                // Wrong key — increment attempt counter; void session at 3
+                session.attempts = (session.attempts || 0) + 1
+                console.warn(`[SECURITY] Wrong key attempt ${session.attempts}/3 from ${senderNumber} (JID: ${senderJid})`)
+
+                if (session.attempts >= 3) {
+                    delete pendingKeys[senderJid]
+                    delete approvalQueue[senderNumber]
+                    await sendSafeMessage(sock, senderJid, {
+                        text:
+                            `🚫 *Session Voided*\n\n` +
+                            `Too many incorrect attempts. Your access session has been cancelled.\n\n` +
+                            `Contact the *Sky Graphics* team to request a new key. 📩`
+                    })
+                    if (creatorNumber) {
+                        try {
+                            await sendSafeMessage(sock, creatorNumber, {
+                                text:
+                                    `⚠️ *Key Session Voided*\n\n` +
+                                    `\`${senderNumber}\` made 3 incorrect key attempts — their session has been cancelled automatically. 🔒`
+                            })
+                        } catch (_) {}
+                    }
+                } else {
+                    await sendSafeMessage(sock, senderJid, {
+                        text:
+                            `❌ *Invalid Key*\n\n` +
+                            `The key you entered is incorrect. (Attempt ${session.attempts}/3)\n\n` +
+                            `Double-check the key and try again: \`/admin YOURKEY\` 🔑`
+                    })
+                }
                 return
             }
 
@@ -221,6 +327,9 @@ async function handleAdminCommand(ctx) {
             saveSettings()
 
             console.log(`👑 Admin registered — PN: ${senderNumber} | JID: ${senderJid}`)
+
+            // Start 30-day inactivity watchdog
+            startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
 
             // Welcome the new admin
             await sendSafeMessage(sock, senderJid, {
@@ -251,6 +360,9 @@ async function handleAdminCommand(ctx) {
         }
 
         // No input — generate key, queue for creator approval
+        // Rate-limit check
+        if (checkAdminRateLimit(senderNumber)) return
+
         const newKey  = generateKey()
         const senderName = ctx.senderName || senderNumber
 
@@ -491,6 +603,8 @@ async function handleAdminCommand(ctx) {
             settings.adminNumber = confirmed.number
             settings.adminJid    = ''
             saveSettings()
+            // Start inactivity watchdog for the new admin
+            startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
             await sendSafeMessage(sock, replyTo, {
                 text:
                     `✅ *Admin updated to* \`${settings.adminNumber}\`\n\n` +
@@ -675,6 +789,18 @@ async function handleAdminCommand(ctx) {
     if (cmd[0] === 'clearwords') {
         const level = cmd[1]
         if (['easy', 'normal', 'difficult'].includes(level)) {
+            // Guard: refuse if this is the only pool with words left
+            const otherLevels = ['easy', 'normal', 'difficult'].filter(l => l !== level)
+            const otherHasWords = otherLevels.some(l => words[l] && words[l].length > 0)
+            if (!otherHasWords) {
+                await sendSafeMessage(sock, replyTo, {
+                    text:
+                        `⚠️ *Cannot clear ${level.toUpperCase()} pool.*\n\n` +
+                        `It's the only pool with words. Clearing it would crash the game when a word is picked.\n\n` +
+                        `Add words to another pool first, then clear this one. 📚`
+                })
+                return
+            }
             words[level] = []
             saveWords()
             await sendSafeMessage(sock, replyTo, {
@@ -724,6 +850,25 @@ async function handleAdminCommand(ctx) {
         return
     }
 
+    // ─── /clearadmin ─────────────────────────────
+    if (cmd[0] === 'clearadmin') {
+        const cleared = settings.adminNumber
+        settings.adminNumber = ''
+        settings.adminJid    = ''
+        saveSettings()
+        if (adminInactivityTimer) {
+            clearInterval(adminInactivityTimer)
+            adminInactivityTimer = null
+        }
+        await sendSafeMessage(sock, replyTo, {
+            text:
+                `✅ *Admin slot cleared.*\n\n` +
+                `${cleared || 'No admin'} has been removed. Word pools and settings are untouched.\n\n` +
+                `The next */admin* request will begin a fresh onboarding. 🔑`
+        })
+        return
+    }
+
     // ─── /reset ──────────────────────────────────
     if (cmd[0] === 'reset') {
         Object.assign(settings, {
@@ -735,6 +880,10 @@ async function handleAdminCommand(ctx) {
         pendingAdminChangeRef.value = null
         Object.assign(words, JSON.parse(JSON.stringify(DEFAULT_WORDS)))
         saveWords()
+        if (adminInactivityTimer) {
+            clearInterval(adminInactivityTimer)
+            adminInactivityTimer = null
+        }
         const SETTINGS_FILE = 'settings.json'
         const GAMES_FILE    = 'games.json'
         if (fs.existsSync(SETTINGS_FILE)) fs.unlinkSync(SETTINGS_FILE)
@@ -752,6 +901,55 @@ async function handleAdminCommand(ctx) {
                 `All settings, games, and word pools restored to defaults.\n\n` +
                 `The bot is now unconfigured. The next */admin* request will begin a fresh onboarding. 🚀`
         })
+        return
+    }
+
+    // ─── /status ─────────────────────────────────
+    if (cmd[0] === 'status') {
+        const activeGameChat = activeGameChatRef.value
+        if (!activeGameChat) {
+            await sendSafeMessage(sock, replyTo, {
+                text:
+                    `📊 *WRG Bot Status*\n\n` +
+                    `🎮 No game or lobby is currently active.\n\n` +
+                    `*Config:*\n` +
+                    `› Difficulty: *${settings.difficulty.toUpperCase()}*\n` +
+                    `› Max Tries: *${settings.maxTries}*\n` +
+                    `› Public Visible: *${settings.publicVisible ? '🟢 ON' : '🔴 OFF'}*\n` +
+                    `› Public Can Start: *${settings.publicCanStart ? '🟢 ON' : '🔴 OFF'}*\n` +
+                    `› Admin: *${settings.adminNumber || 'None'}*`
+            })
+        } else {
+            const gs = getGameState(activeGameChat)
+            let statusText = `📊 *WRG Bot Status*\n\n`
+
+            if (gs.lobbyActive) {
+                statusText += `🏠 *LOBBY OPEN* — ${activeGameChat}\n`
+                statusText += `👥 Players joined: *${gs.players.length}*\n`
+                statusText += `⏱️ Time left: *${gs.lobbySecondsLeft}s*\n`
+                if (gs.players.length > 0) {
+                    statusText += `\n*Players:*\n`
+                    gs.players.forEach((num, i) => {
+                        statusText += `${i + 1}. ${gs.playerNames[num] || num}\n`
+                    })
+                }
+            } else if (gs.active) {
+                const currentPlayer = gs.players[gs.currentTurnIndex]
+                statusText += `🎮 *GAME IN PROGRESS* — ${activeGameChat}\n`
+                statusText += gs.paused ? `⏸️ Status: *PAUSED*\n` : `▶️ Status: *LIVE*\n`
+                statusText += `📝 Word: \`${gs.hiddenWord.join(' ')}\` (${gs.targetWord.length} letters)\n`
+                statusText += `💥 Attempts left: *${settings.maxTries - gs.attempts}/${settings.maxTries}*\n`
+                statusText += `🎯 Current turn: *${gs.playerNames[currentPlayer] || currentPlayer}*\n`
+                statusText += `👥 Players: *${gs.players.length}*\n`
+                if (!gs.paused) statusText += `⏱️ Turn timer: *${gs.turnSecondsLeft}s*\n`
+            }
+
+            statusText += `\n*Config:*\n`
+            statusText += `› Difficulty: *${settings.difficulty.toUpperCase()}*\n`
+            statusText += `› Max Tries: *${settings.maxTries}*`
+
+            await sendSafeMessage(sock, replyTo, { text: statusText })
+        }
         return
     }
 
