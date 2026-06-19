@@ -499,6 +499,20 @@ async function startBot() {
         for (const msg of messages) {
             if (!msg.message) continue
 
+            // Auto-seed LID mapping from every incoming message
+            const senderJid = msg.key.participant || msg.key.remoteJid
+            const pnJid = msg.key.senderPn 
+                ? (msg.key.senderPn.includes('@') ? msg.key.senderPn : `${msg.key.senderPn}@s.whatsapp.net`)
+                : null
+
+            if (senderJid?.includes('@lid') && pnJid) {
+                const existing = await redis.get(`pn:${senderJid}`).catch(() => null)
+                if (!existing) {
+                    await redis.set(`lid:${pnJid}`, senderJid).catch(() => {})
+                    await redis.set(`pn:${senderJid}`, pnJid).catch(() => {})
+                    console.log(`📌 Auto-seeded LID mapping: ${pnJid} ↔ ${senderJid}`)
+                }
+            }
             // Capture LID ↔ PN mapping whenever we see a message with both fields
             // This populates Redis so outbound DMs to this number always resolve correctly
             const incomingLid = msg.key.remoteJid
