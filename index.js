@@ -290,16 +290,49 @@ async function startBot() {
             const rawBody = text.trim()
 
             const sender = msg.key.participant || msg.key.remoteJid || ''
-            const senderNumber = msg.key.senderPn
-                ? msg.key.senderPn.split('@')[0].split(':')[0]
-                : sender.split('@')[0].split(':')[0]
+
+            // ── senderNumber resolution ──────────────────────────────────────────
+            // Priority 1: msg.key.senderPn — Baileys' explicit phone-number field.
+            // Priority 2: fromMe — the message is from the bot's own account, which
+            //   is always the creator. Use CREATOR_JID so the number is correct even
+            //   when senderPn is absent (common in many Baileys builds for outbound msgs).
+            // Priority 3: strip @-suffix and device tag from whatever JID we have.
+            //   NOTE: this fallback can be a @lid identifier (not a phone number) on
+            //   newer WhatsApp multidevice accounts — the comparison in isCreator()
+            //   will then silently fail. Priorities 1 and 2 avoid that for the creator.
+            let senderNumber
+            if (msg.key.senderPn) {
+                senderNumber = msg.key.senderPn.split('@')[0].split(':')[0]
+            } else if (msg.key.fromMe) {
+                // fromMe = this is our own account = the creator.
+                // Derive the number from CREATOR_JID so isCreator() matches correctly.
+                const creatorJid = process.env.CREATOR_JID || ''
+                senderNumber = creatorJid
+                    ? creatorJid.split('@')[0].split(':')[0]
+                    : sender.split('@')[0].split(':')[0]
+            } else {
+                senderNumber = sender.split('@')[0].split(':')[0]
+            }
+
+            // ── senderJid: the JID we can actually send a DM back to ─────────────
+            // In a group, msg.key.participant is the sender's JID.
+            // In a fromMe DM, msg.key.participant is undefined and remoteJid is the
+            // chat partner — both are wrong for replying TO the creator. Use CREATOR_JID.
+            const senderJid = msg.key.fromMe
+                ? (process.env.CREATOR_JID || (senderNumber ? `${senderNumber}@s.whatsapp.net` : sender))
+                : (msg.key.participant || sender)
 
             const senderName = msg.pushName || senderNumber
             rememberName(senderNumber, msg.pushName)
 
             const isAdmin = msg.key.fromMe || senderNumber === settings.adminNumber || settings.adminNumber === ''
 
-            if (!isAdmin && !settings.publicVisible) continue
+            // Non-admins are invisible to the bot unless publicVisible is on —
+            // EXCEPT for slash-commands (adminPrefix), which must always reach
+            // adminCommands.js so the /admin key-request onboarding flow works
+            // even when publicVisible is off. adminCommands.js handles its own
+            // per-command permission gates internally.
+            if (!isAdmin && !settings.publicVisible && !body.startsWith(settings.adminPrefix)) continue
 
             // Refresh admin name + JID on every message from admin
             if (senderNumber === settings.adminNumber) {
@@ -324,7 +357,7 @@ async function startBot() {
                     fs,
                     senderNumber,
                     senderName,
-                    senderJid: sender,
+                    senderJid: senderJid,
                     sender: from,
                     body,
                     isAdmin
