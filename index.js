@@ -11,18 +11,34 @@ const redis = new Redis(process.env.REDIS_URL)
 redis.on('connect', () => console.log('✅ Redis connected'))
 redis.on('error', (err) => console.log('⚠️ Redis error:', err.message))
 
-// Safe send: resolves LID from Redis cache first, falls back to Baileys resolver, then raw PN
-async function sendSafeMessage(sock, phoneNumber, payload) {
-    const pnJid = phoneNumber.includes('@') ? phoneNumber : `${phoneNumber}@s.whatsapp.net`
+// Safe send: if a full JID is passed (e.g. @lid or @s.whatsapp.net), send directly — no Redis
+// lookup needed. The LID migration means we now store the admin's full sender JID at registration
+// time and use it for all outbound DMs, so the PN→LID resolution path is only needed for legacy
+// stored plain numbers (e.g. a manually configured adminNumber from before LID support).
+async function sendSafeMessage(sock, jidOrNumber, payload) {
+    // Fast path: already a full JID — send directly, zero Redis overhead.
+    if (jidOrNumber.includes('@')) {
+        console.log(`[sendSafe] Direct JID send to: ${jidOrNumber}`)
+        try {
+            const result = await sock.sendMessage(jidOrNumber, payload)
+            console.log(`[sendSafe] Sent OK:`, JSON.stringify(result?.key))
+        } catch (err) {
+            console.log(`[sendSafe] Direct send error:`, err.message)
+        }
+        return
+    }
+
+    // Legacy path: plain phone number stored — attempt Redis + Baileys resolution as before.
+    const pnJid = `${jidOrNumber}@s.whatsapp.net`
     let targetJid = null
 
-    console.log(`[sendSafe] Attempting to send to: ${pnJid}`)
+    console.log(`[sendSafe] Attempting PN→LID resolution for: ${pnJid}`)
 
-    try { 
+    try {
         targetJid = await redis.get(`lid:${pnJid}`)
         console.log(`[sendSafe] Redis cache result: ${targetJid}`)
-    } catch (err) { 
-        console.log(`[sendSafe] Redis lookup failed:`, err.message) 
+    } catch (err) {
+        console.log(`[sendSafe] Redis lookup failed:`, err.message)
     }
 
     if (!targetJid) {
@@ -33,8 +49,8 @@ async function sendSafeMessage(sock, phoneNumber, payload) {
                 await redis.set(`lid:${pnJid}`, targetJid)
                 await redis.set(`pn:${targetJid}`, pnJid)
             }
-        } catch (err) { 
-            console.log(`[sendSafe] Baileys LID resolver failed:`, err.message) 
+        } catch (err) {
+            console.log(`[sendSafe] Baileys LID resolver failed:`, err.message)
         }
     }
 
@@ -55,7 +71,8 @@ const WORDS_FILE = 'words.json'
 const GAMES_FILE = 'games.json'
 
 let settings = {
-    adminNumber: '', // Will be set on first message or manually
+    adminNumber: '', // PN (e.g. 237682477421) — used for game logic comparisons and display
+    adminJid: '',    // Full sender JID (may be @lid, e.g. 77705185873989:15@lid) — used for sending DMs
     difficulty: 'easy',
     maxTries: 10, // Shared mistake budget for the WHOLE round (wrong letters + timeouts combined),
                   // not per player and not based on word length. Tune with /set maxtries [n].
@@ -68,6 +85,10 @@ let settings = {
 if (fs.existsSync(SETTINGS_FILE)) {
     settings = JSON.parse(fs.readFileSync(SETTINGS_FILE))
     if (typeof settings.publicStart === 'undefined') settings.publicStart = false
+    // Backfill adminJid for installs that predate LID support.
+    // If adminNumber is a plain PN (no @), adminJid stays '' until the admin next
+    // messages the bot — at which point we capture their real sender JID below.
+    if (typeof settings.adminJid === 'undefined') settings.adminJid = ''
 }
 
 function saveSettings() {
@@ -263,12 +284,13 @@ async function startBot() {
             // a single process (e.g. brief network drops) don't spam the admin's DM.
             if (!hasSentBootAdminConfirmation) {
                 hasSentBootAdminConfirmation = true
-                if (settings.adminNumber) {
+                const bootTarget = settings.adminJid || settings.adminNumber
+                if (bootTarget) {
                     try {
-                        await sendSafeMessage(sock, settings.adminNumber, {
+                        await sendSafeMessage(sock, bootTarget, {
                             text: `🔁 *WRG Bot is back online.*\n\n👑 You are registered as the administrator (${settings.adminNumber}).\n\nType */help* here at any time to see all admin commands.`
                         })
-                        console.log(`👑 Sent boot/redeploy confirmation DM to admin ${settings.adminNumber}`)
+                        console.log(`👑 Sent boot/redeploy confirmation DM to admin ${bootTarget}`)
                     } catch (err) {
                         console.log('⚠️ Could not DM the admin on boot (they may need to message the bot directly first):', err.message)
                     }
@@ -564,19 +586,26 @@ async function startBot() {
             // IMPROVEMENT 6: refresh the admin's cached display name every time the admin
             // sends ANY message (not just slash commands), so lobby listings never show a
             // stale name even if the admin only ever types "wrg join" / "WRG".
+            // Also refresh adminJid in case the admin's LID or device suffix changed.
             if (senderNumber === settings.adminNumber && msg.pushName) {
                 rememberName(settings.adminNumber, msg.pushName)
+            }
+            if (senderNumber === settings.adminNumber && sender && sender !== settings.adminJid) {
+                settings.adminJid = sender
+                saveSettings()
+                console.log(`[admin] Updated adminJid to: ${settings.adminJid}`)
             }
 
             // Set Admin on first admin command if not set, then DM confirmation.
             if (settings.adminNumber === '' && body.startsWith(settings.adminPrefix)) {
-                settings.adminNumber = senderNumber
+                settings.adminNumber = senderNumber   // PN for game logic + comparisons
+                settings.adminJid = sender            // Full JID (may be @lid) for sending DMs
                 saveSettings()
-                console.log(`👑 Admin set to: ${settings.adminNumber}`)
+                console.log(`👑 Admin set to PN: ${settings.adminNumber} | JID: ${settings.adminJid}`)
 
                 // IMPROVEMENT (from Q&A): confirm admin registration via DM immediately.
                 try {
-                    await sendSafeMessage(sock, settings.adminNumber, {
+                    await sendSafeMessage(sock, settings.adminJid || settings.adminNumber, {
                         text: `👑 You have been registered as the WRG administrator.\n\nType */help* here at any time to see all admin commands.`
                     })
                 } catch (err) {
@@ -595,7 +624,9 @@ async function startBot() {
                 }
 
                 const cmd = body.slice(1).split(' ')
-                const adminJid = settings.adminNumber ? jidOf(settings.adminNumber) : sender
+                // adminJid: the JID we reply to. Prefer the stored full JID (which may be @lid)
+                // so messages arrive in the admin's DM without any PN→LID resolution step.
+                const adminJid = settings.adminJid || (settings.adminNumber ? jidOf(settings.adminNumber) : sender)
 
                 if (cmd[0] === 'admin' || cmd[0] === 'help') {
                     const adminHelp = `*👑 WRG Admin Dashboard*\n\nHere are your configuration commands. You can type them in *any* chat — the results always come back to this DM only, never the chat you typed them in.\n\n*Configuration Commands:*\n• \`/set difficulty [easy/normal/difficult]\` - Set default mode.\n• \`/set admin [number]\` - Update admin phone number.\n• \`/set public [on/off]\` - Allow/restrict who can type WRG to start a game.\n• \`/set maxtries [number]\` - Set the shared mistake budget (wrong letters + timeouts) for a round.\n• \`/addword [level] [word]\` - Add a word to the pool.\n• \`/removeword [level] [word]\` - Delete a word.\n• \`/listwords [level]\` - View all words in a pool.\n\n*Group Game Controls (act on whichever chat the active game is actually running in, not the chat you type from):*\n• \`/pause\` - Pause the active game timer.\n• \`/resume\` - Resume the active game timer.\n• \`/end\` - Terminate the active game.\n\n*Lockout rule:* any player who fails to respond on *3 turns in a row* is removed from the round. If that leaves zero players, the round ends immediately — it never auto-restarts; only typing *WRG* again starts a new one. If exactly one player remains after disqualifications, they win instantly as Last Player Standing.`
@@ -615,8 +646,11 @@ async function startBot() {
                     const newAdmin = (cmd[2] || '').replace(/[^0-9]/g, '')
                     if (newAdmin) {
                         settings.adminNumber = newAdmin
+                        // Clear adminJid — it will be repopulated automatically the next time
+                        // the new admin sends a message, capturing their real sender JID.
+                        settings.adminJid = ''
                         saveSettings()
-                        await sendSafeMessage(sock, adminJid, { text: `👑 Admin number updated to: *${settings.adminNumber}*` })
+                        await sendSafeMessage(sock, adminJid, { text: `👑 Admin number updated to: *${settings.adminNumber}*. The new admin must send one message to the bot so their JID can be captured for DM delivery.` })
                         try {
                             await sendSafeMessage(sock, settings.adminNumber, {
                                 text: `👑 You have been registered as the WRG administrator.\n\nType */help* here at any time to see all admin commands.`
@@ -762,6 +796,7 @@ async function startBot() {
                 else if (cmd[0] === 'reset') {
                     settings = {
                         adminNumber: '',
+                        adminJid: '',
                         difficulty: 'easy',
                         maxTries: 10,
                         prefix: 'wrg',
@@ -895,7 +930,10 @@ async function startBot() {
                     gameState.playerNames[settings.adminNumber] = displayName(settings.adminNumber)
                 }
 
-                const adminMention = settings.adminNumber ? [jidOf(settings.adminNumber)] : []
+                // For WhatsApp mentions we need a proper JID. Prefer the stored @lid JID if
+                // available (that's what Baileys v7 expects for DM targets); fall back to PN JID.
+                const adminMentionJid = settings.adminJid || (settings.adminNumber ? jidOf(settings.adminNumber) : null)
+                const adminMention = adminMentionJid ? [adminMentionJid] : []
                 const adminLobbyText = settings.adminNumber ? `1. ${tag(settings.adminNumber)} (Auto-joined)` : '[No players joined yet]'
 
                 await sock.sendMessage(from, {
