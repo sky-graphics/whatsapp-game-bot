@@ -137,6 +137,7 @@ function buildHelpText(settings, forCreator = false) {
         `› \`/set admin [number]\` → \`/confirm\` · \`/cancel\`\n` +
         `› \`/set public [on/off]\` — non-admin visibility\n` +
         `› \`/set start [on/off]\` — public lobby start\n` +
+        `› \`/set autojoin [on/off]\` — auto-join lobbies when they open\n` +
         `› \`/set maxtries [n]\` — attempt budget\n` +
         `› \`/clearadmin\` — clear admin slot only (keeps pools)\n` +
         `› \`/reset\` — ⚠️ wipe ALL data\n\n` +
@@ -166,6 +167,7 @@ function buildHelpText(settings, forCreator = false) {
         `› Max Tries: *${formatMaxTries(resolveSetting('maxTries', settings, 'auto'))}*\n` +
         `› Public Visible: *${resolveSetting('publicVisible', settings, true) ? '🟢 ON' : '🔴 OFF'}*\n` +
         `› Public Can Start: *${resolveSetting('publicCanStart', settings, false) ? '🟢 ON' : '🔴 OFF'}*\n` +
+        `› Auto-Join Lobby: *${resolveSetting('autoJoin', settings, true) ? '🟢 ON' : '🔴 OFF'}*\n` +
         `› Admin Set: *${settings.adminNumber ? '✅ ' + settings.adminNumber : '❌ None'}*\n\n` +
 
         `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
@@ -324,12 +326,10 @@ async function handleAdminCommand(ctx) {
             delete approvalQueue[senderNumber]
             delete approvalQueue[displayId]
 
-            // FIX: extract real PN from requesterJid (built from DM remoteJid).
-            // When the admin types the key in a DM to the bot, remoteJid is always
-            // their real @s.whatsapp.net JID — so we get their real PN here cleanly.
-            // This overwrites senderNumber which may have been empty or a LID.
+            // Extract real PN from requesterJid — when admin types key in DM
+            // remoteJid is always their real @s.whatsapp.net JID.
             const confirmedPN  = requesterJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
-            const confirmedJid = requesterJid  // already clean — built from real PN
+            const confirmedJid = requesterJid
 
             settings.adminNumber = confirmedPN  || senderNumber || displayId
             settings.adminJid    = confirmedJid || senderJid
@@ -339,34 +339,45 @@ async function handleAdminCommand(ctx) {
 
             startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
 
-            // Send "Access Granted" + dashboard immediately to the admin's DM.
-            // They typed the key in a DM so confirmedJid is their real DM JID.
-            // No need to tell them to type /help — it appears right below.
             await sendSafeMessage(sock, confirmedJid, {
                 text:
-                    `╔══════════════════════════╗\n` +
-                    `   👑  Access Granted\n` +
-                    `╚══════════════════════════╝\n\n` +
-                    `*Welcome, Administrator!* 🎉\n\n` +
-                    `You now have full control of the *WRG Bot* for your community.\n\n` +
-                    `Your dashboard is below — everything you need is right here. ⬇️\n\n` +
-                    `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+                    `╔══════════════════════════╗
+` +
+                    `   👑  Access Granted
+` +
+                    `╚══════════════════════════╝
+
+` +
+                    `*Welcome, Administrator!* 🎉
+
+` +
+                    `You now have full control of the *WRG Bot* for your community.
+
+` +
+                    `Your dashboard is below — everything you need is right here. ⬇️
+
+` +
+                    `━━━━━━━━━━━━━━━━━━━━━━━━━━
+` +
                     `_WRG Bot · Sky Graphics_ 🎨`
             })
 
-            // Send dashboard automatically — admin sees it without typing /help
             await sendSafeMessage(sock, confirmedJid, {
                 text: buildHelpText(settings, false)
             })
 
-            // Notify creator — now always shows real PN since confirmedPN is clean
             if (creatorJid) {
                 try {
                     await sendSafeMessage(sock, creatorJid, {
                         text:
-                            `✅ *Admin Registration Complete*\n\n` +
-                            `👤 Name: *${approvedSession.senderName || 'Unknown'}*\n` +
-                            `📱 Number: \`${settings.adminNumber}\`\n\n` +
+                            `✅ *Admin Registration Complete*
+
+` +
+                            `👤 Name: *${approvedSession.senderName || 'Unknown'}*
+` +
+                            `📱 Number: \`${settings.adminNumber}\`
+
+` +
                             `_Bot is now live under new admin._ 🚀`
                     })
                 } catch (_) {}
@@ -724,6 +735,29 @@ async function handleAdminCommand(ctx) {
         return
     }
 
+    // ─── /set autojoin ────────────────────────────
+    // Controls whether the creator/admin automatically joins every lobby
+    // that opens. ON = auto-join with role badge. OFF = must type wrg join.
+    // Each role (creator/admin) has their own independent switch stored
+    // via writeSetting so creator's choice never overwrites admin's.
+    if (cmd[0] === 'set' && cmd[1] === 'autojoin') {
+        const mode = cmd[2]
+        if (mode === 'on' || mode === 'off') {
+            const newValue = (mode === 'on')
+            writeSetting(tier, 'autoJoin', newValue, settings)
+            saveSettings()
+            const roleLabel = senderIsCreator ? 'Creator' : 'Admin'
+            await sendSafeMessage(sock, replyTo, {
+                text: newValue
+                    ? `🟢 *Auto-Join: ON*\nYou (${roleLabel}) will automatically join every lobby when it opens. 🎮`
+                    : `🔴 *Auto-Join: OFF*\nYou (${roleLabel}) must type *wrg join* to enter lobbies manually. 👋`
+            })
+        } else {
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/set autojoin [on/off]\`` })
+        }
+        return
+    }
+
     // ─── Word pool commands ───────────────────────
     if (cmd[0] === 'addword') {
         const level = cmd[1], word = cmd[2]
@@ -890,6 +924,7 @@ async function handleAdminCommand(ctx) {
         settings.maxTries       = 'auto'
         settings.publicVisible  = true
         settings.publicCanStart = false
+        settings.autoJoin       = true   // reset admin auto-join to default ON
         pendingAdminChangeRef.value = null
         saveSettings()
         if (adminInactivityTimer) {
@@ -961,6 +996,7 @@ async function handleAdminCommand(ctx) {
                     `› Max Tries: *${formatMaxTries(resolveSetting('maxTries', settings, 'auto'))}*\n` +
                     `› Public Visible: *${resolveSetting('publicVisible', settings, true) ? '🟢 ON' : '🔴 OFF'}*\n` +
                     `› Public Can Start: *${resolveSetting('publicCanStart', settings, false) ? '🟢 ON' : '🔴 OFF'}*\n` +
+                    `› Auto-Join Lobby: *${resolveSetting('autoJoin', settings, true) ? '🟢 ON' : '🔴 OFF'}*\n` +
                     `› Admin: *${settings.adminNumber || 'None'}*`
             })
         } else {
