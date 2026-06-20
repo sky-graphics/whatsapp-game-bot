@@ -322,35 +322,51 @@ async function handleAdminCommand(ctx) {
             const approvedSession = { ...session }
             delete pendingKeys[senderJid]
             delete approvalQueue[senderNumber]
+            delete approvalQueue[displayId]
 
-            settings.adminNumber = senderNumber
-            settings.adminJid    = senderJid
+            // FIX: extract real PN from requesterJid (built from DM remoteJid).
+            // When the admin types the key in a DM to the bot, remoteJid is always
+            // their real @s.whatsapp.net JID — so we get their real PN here cleanly.
+            // This overwrites senderNumber which may have been empty or a LID.
+            const confirmedPN  = requesterJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
+            const confirmedJid = requesterJid  // already clean — built from real PN
+
+            settings.adminNumber = confirmedPN  || senderNumber || displayId
+            settings.adminJid    = confirmedJid || senderJid
             saveSettings()
 
-            console.log(`👑 Admin registered — PN: ${senderNumber} | JID: ${senderJid}`)
+            console.log(`👑 Admin registered — PN: ${settings.adminNumber} | JID: ${settings.adminJid}`)
 
             startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
 
-            await sendSafeMessage(sock, requesterJid, {
+            // Send "Access Granted" + dashboard immediately to the admin's DM.
+            // They typed the key in a DM so confirmedJid is their real DM JID.
+            // No need to tell them to type /help — it appears right below.
+            await sendSafeMessage(sock, confirmedJid, {
                 text:
                     `╔══════════════════════════╗\n` +
                     `   👑  Access Granted\n` +
                     `╚══════════════════════════╝\n\n` +
                     `*Welcome, Administrator!* 🎉\n\n` +
                     `You now have full control of the *WRG Bot* for your community.\n\n` +
-                    `Type */help* to see everything at your fingertips. ⚡\n\n` +
+                    `Your dashboard is below — everything you need is right here. ⬇️\n\n` +
                     `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
                     `_WRG Bot · Sky Graphics_ 🎨`
             })
 
-            // FIX BUG-15: notify creator via creatorJid not creatorNumber
+            // Send dashboard automatically — admin sees it without typing /help
+            await sendSafeMessage(sock, confirmedJid, {
+                text: buildHelpText(settings, false)
+            })
+
+            // Notify creator — now always shows real PN since confirmedPN is clean
             if (creatorJid) {
                 try {
                     await sendSafeMessage(sock, creatorJid, {
                         text:
                             `✅ *Admin Registration Complete*\n\n` +
                             `👤 Name: *${approvedSession.senderName || 'Unknown'}*\n` +
-                            `📱 Number: \`${senderNumber}\`\n\n` +
+                            `📱 Number: \`${settings.adminNumber}\`\n\n` +
                             `_Bot is now live under new admin._ 🚀`
                     })
                 } catch (_) {}
