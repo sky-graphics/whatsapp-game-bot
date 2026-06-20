@@ -14,34 +14,30 @@
 // ============================================================
 
 const crypto = require('crypto')
-const { isCreator: _checkCreator, isAdmin: _checkAdmin } = require('./permissions')
+
+// FIX BUG-10: single clean import — no duplicate require
 const {
-    TIERS, getTier, isCreator: isCreatorFn, isAdmin: isAdminFn,
-    canRunCommand, difficultyBadge, writeSetting, resolveSetting,
-    getReplyTarget, nameTag
+    TIERS, getTier, isCreator: isCreatorFn,
+    canRunCommand, difficultyBadge, writeSetting,
+    resolveSetting, getReplyTarget, nameTag
 } = require('./permissions')
 
 // ─── Pending key sessions ────────────────────────────────────
 // Map: senderJid → { key, expiresAt, senderNumber, senderName, attempts }
-// Keys are ALWAYS bound to the exact JID that requested them.
 const pendingKeys = {}
 
 // ─── Pending approval queue ──────────────────────────────────
-// Map: senderNumber → senderJid  (so creator can /approve by number)
+// Map: senderNumber → senderJid
 const approvalQueue = {}
 
 // ─── Rate limiting: /admin spam lockout ──────────────────────
-// Map: senderNumber → { count, lockedUntil }
-// 5 /admin presses → 10-minute silent lockout
 const adminRateLimit = {}
 
 // ─── Admin inactivity tracker ────────────────────────────────
-// Tracks the last time admin ran any command. Auto-clears slot after 30 days.
-let adminLastActive = 0          // epoch ms — set on every admin command
-let adminInactivityTimer = null  // single global interval
+let adminLastActive = 0
+let adminInactivityTimer = null
 
 function generateKey() {
-    // Standard UUID v4 — globally unique, not just "large enough to guess"
     return crypto.randomUUID()
 }
 
@@ -56,15 +52,12 @@ function cleanExpiredKeys() {
     }
 }
 
-// Returns true if this senderNumber is currently rate-limited.
-// Increments counter; locks out at 5 hits within any window.
 function checkAdminRateLimit(senderNumber) {
     const now = Date.now()
     const entry = adminRateLimit[senderNumber] || { count: 0, lockedUntil: 0 }
 
-    if (now < entry.lockedUntil) return true  // still locked
+    if (now < entry.lockedUntil) return true
 
-    // Reset count if lockout has expired
     if (entry.lockedUntil && now >= entry.lockedUntil) {
         entry.count = 0
         entry.lockedUntil = 0
@@ -72,15 +65,13 @@ function checkAdminRateLimit(senderNumber) {
 
     entry.count++
     if (entry.count >= 5) {
-        entry.lockedUntil = now + 10 * 60 * 1000  // 10-minute lockout
+        entry.lockedUntil = now + 10 * 60 * 1000
         entry.count = 0
     }
     adminRateLimit[senderNumber] = entry
     return false
 }
 
-// Start (or restart) the 30-day admin inactivity watchdog.
-// If the admin slot goes 30 days with no command, it auto-clears.
 function startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage) {
     if (adminInactivityTimer) clearInterval(adminInactivityTimer)
     adminLastActive = Date.now()
@@ -101,11 +92,11 @@ function startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage
             settings.adminJid    = ''
             saveSettings()
 
-            const creatorJid    = process.env.CREATOR_JID
-            const creatorNumber = (creatorJid || '').split('@')[0].split(':')[0]
-            if (creatorNumber) {
+            // FIX BUG-15: use full CREATOR_JID (valid JID) not bare creatorNumber digits
+            const creatorJid = process.env.CREATOR_JID || ''
+            if (creatorJid) {
                 try {
-                    await sendSafeMessage(sock, creatorNumber, {
+                    await sendSafeMessage(sock, creatorJid, {
                         text:
                             `⚠️ *Admin Slot Auto-Cleared*\n\n` +
                             `${cleared} has been inactive for *30 days* — the admin slot has been reset.\n\n` +
@@ -115,14 +106,7 @@ function startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage
             }
             console.log(`[inactivity] Admin slot cleared — ${cleared} inactive for 30 days.`)
         }
-    }, 60 * 60 * 1000)  // check every hour
-}
-
-function isCreator(senderNumber, senderJid) {
-    // Use permissions.js which checks BOTH senderNumber and senderJid.
-    // This handles WhatsApp LID routing where the creator's messages
-    // arrive via a LID instead of their real PN.
-    return _checkCreator(senderNumber, senderJid, {})
+    }, 60 * 60 * 1000)
 }
 
 // ─── Help dashboard ───────────────────────────────────────────
@@ -190,14 +174,20 @@ async function handleAdminCommand(ctx) {
         sock, settings, words, games, activeGameChatRef,
         pendingAdminChangeRef, saveSettings, saveWords, persistGames,
         sendSafeMessage, getGameState, startTurnCountdown,
-        jidOf, tag, DEFAULT_WORDS, fs,
-        senderNumber, senderJid, body, isAdmin
+        DEFAULT_WORDS, fs,
+        senderNumber, senderJid, senderName, body, senderTier
     } = ctx
 
-    const creatorJid  = process.env.CREATOR_JID
-    const creatorNumber = (creatorJid || '').split('@')[0].split(':')[0]
-    const senderIsCreator = isCreator(senderNumber, senderJid)
-    const adminJid = settings.adminNumber || settings.adminJid || senderJid
+    const creatorJid    = process.env.CREATOR_JID || ''
+    const creatorNumber = creatorJid.split('@')[0].split(':')[0]
+
+    // FIX BUG-11: derive tier from ctx.senderTier (computed in index.js)
+    // and expose isAdmin / senderIsCreator from it
+    const senderIsCreator = senderTier === TIERS.CREATOR
+    const isAdmin         = senderTier === TIERS.CREATOR || senderTier === TIERS.ADMIN
+
+    // FIX BUG-11: tier is now always defined
+    const tier = senderTier || TIERS.PUBLIC
 
     const raw = body.slice(1).trim()
     const cmd = raw.split(' ')
@@ -205,7 +195,6 @@ async function handleAdminCommand(ctx) {
     // Bump inactivity clock on every admin/creator command
     if (senderIsCreator || isAdmin) {
         adminLastActive = Date.now()
-        // Start the watchdog if admin is set and timer isn't running
         if (settings.adminNumber && !adminInactivityTimer) {
             startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
         }
@@ -216,7 +205,7 @@ async function handleAdminCommand(ctx) {
     // ══════════════════════════════════════════════
     if (cmd[0] === 'admin') {
 
-        // Creator gets a special identity message
+        // Creator gets special identity message — reply always to senderJid
         if (senderIsCreator) {
             await sendSafeMessage(sock, senderJid, {
                 text:
@@ -233,17 +222,15 @@ async function handleAdminCommand(ctx) {
             return
         }
 
-        // Confirmed admin → redirect to /help silently
+        // FIX BUG-16: confirmed admin → reply to senderJid not adminJid
         if (isAdmin && settings.adminNumber !== '') {
-            await sendSafeMessage(sock, adminJid, { text: buildHelpText(settings, false) })
+            await sendSafeMessage(sock, senderJid, { text: buildHelpText(settings, false) })
             return
         }
 
-        // Admin already set → subtle generic reply for non-admins (item 6)
+        // Admin already set → subtle generic reply for non-admins
         if (settings.adminNumber !== '' && !isAdmin) {
-            // Rate-limit check first
-            if (checkAdminRateLimit(senderNumber)) return  // locked out — total silence
-
+            if (checkAdminRateLimit(senderNumber)) return
             await sendSafeMessage(sock, senderJid, {
                 text: `ℹ️ This bot is already configured. Contact the group admin for assistance.`
             })
@@ -254,15 +241,11 @@ async function handleAdminCommand(ctx) {
         const input = cmd.slice(1).join(' ').trim()
 
         if (input) {
-            // Person is submitting a key
-
-            // Rate-limit check
             if (checkAdminRateLimit(senderNumber)) return
 
             const session = pendingKeys[senderJid]
 
             if (!session) {
-                // No session found for THIS JID — silent fail (security: don't hint)
                 await sendSafeMessage(sock, senderJid, {
                     text:
                         `🔒 *Access Denied*\n\n` +
@@ -285,7 +268,6 @@ async function handleAdminCommand(ctx) {
             }
 
             if (input.toLowerCase() !== session.key.toLowerCase()) {
-                // Wrong key — increment attempt counter; void session at 3
                 session.attempts = (session.attempts || 0) + 1
                 console.warn(`[SECURITY] Wrong key attempt ${session.attempts}/3 from ${senderNumber} (JID: ${senderJid})`)
 
@@ -298,9 +280,10 @@ async function handleAdminCommand(ctx) {
                             `Too many incorrect attempts. Your access session has been cancelled.\n\n` +
                             `Contact the *Sky Graphics* team to request a new key. 📩`
                     })
-                    if (creatorNumber) {
+                    // FIX BUG-15: use creatorJid not creatorNumber
+                    if (creatorJid) {
                         try {
-                            await sendSafeMessage(sock, creatorNumber, {
+                            await sendSafeMessage(sock, creatorJid, {
                                 text:
                                     `⚠️ *Key Session Voided*\n\n` +
                                     `\`${senderNumber}\` made 3 incorrect key attempts — their session has been cancelled automatically. 🔒`
@@ -318,7 +301,7 @@ async function handleAdminCommand(ctx) {
                 return
             }
 
-            // ✅ Correct key + correct JID — register as admin
+            // ✅ Correct key — register as admin
             const approvedSession = { ...session }
             delete pendingKeys[senderJid]
             delete approvalQueue[senderNumber]
@@ -329,10 +312,8 @@ async function handleAdminCommand(ctx) {
 
             console.log(`👑 Admin registered — PN: ${senderNumber} | JID: ${senderJid}`)
 
-            // Start 30-day inactivity watchdog
             startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
 
-            // Welcome the new admin
             await sendSafeMessage(sock, senderJid, {
                 text:
                     `╔══════════════════════════╗\n` +
@@ -345,10 +326,10 @@ async function handleAdminCommand(ctx) {
                     `_WRG Bot · Sky Graphics_ 🎨`
             })
 
-            // Notify creator silently
+            // FIX BUG-15: notify creator via creatorJid not creatorNumber
             if (creatorJid) {
                 try {
-                    await sendSafeMessage(sock, creatorNumber, {
+                    await sendSafeMessage(sock, creatorJid, {
                         text:
                             `✅ *Admin Registration Complete*\n\n` +
                             `👤 Name: *${approvedSession.senderName || 'Unknown'}*\n` +
@@ -361,21 +342,19 @@ async function handleAdminCommand(ctx) {
         }
 
         // No input — generate key, queue for creator approval
-        // Rate-limit check
         if (checkAdminRateLimit(senderNumber)) return
 
-        const newKey  = generateKey()
-        const senderName = ctx.senderName || senderNumber
+        const newKey     = generateKey()
+        const reqName    = senderName || senderNumber
 
         pendingKeys[senderJid] = {
             key: newKey,
             expiresAt: Date.now() + 10 * 60 * 1000,
             senderNumber,
-            senderName
+            senderName: reqName
         }
         approvalQueue[senderNumber] = senderJid
 
-        // Message to the person — clean, no internal detail
         await sendSafeMessage(sock, senderJid, {
             text:
                 `╔══════════════════════════╗\n` +
@@ -390,16 +369,16 @@ async function handleAdminCommand(ctx) {
                 `📩 Don't have a key? Contact Sky Graphics to request access.`
         })
 
-        // Alert creator with full detail + approval options
+        // FIX BUG-15: alert creator via creatorJid
         if (creatorJid) {
             try {
-                await sendSafeMessage(sock, creatorNumber, {
+                await sendSafeMessage(sock, creatorJid, {
                     text:
                         `╔══════════════════════════╗\n` +
                         `   🔔  Admin Access Request\n` +
                         `╚══════════════════════════╝\n\n` +
                         `Someone is requesting admin access to your bot.\n\n` +
-                        `👤 *Name:* ${senderName}\n` +
+                        `👤 *Name:* ${reqName}\n` +
                         `📱 *Number:* \`${senderNumber}\`\n` +
                         `🗝️ *Key:* \`${newKey}\`\n\n` +
                         `*What do you want to do?*\n\n` +
@@ -425,11 +404,12 @@ async function handleAdminCommand(ctx) {
     //  /approve [number] — CREATOR ONLY
     // ══════════════════════════════════════════════
     if (cmd[0] === 'approve') {
-        if (!senderIsCreator) return  // total silence
+        if (!senderIsCreator) return
 
         const targetNumber = (cmd[1] || '').replace(/[^0-9]/g, '')
         if (!targetNumber) {
-            await sendSafeMessage(sock, creatorNumber, {
+            // FIX BUG-15: reply to creatorJid not creatorNumber
+            await sendSafeMessage(sock, creatorJid, {
                 text: `⚠️ Usage: \`/approve [number]\``
             })
             return
@@ -437,7 +417,7 @@ async function handleAdminCommand(ctx) {
 
         const targetJid = approvalQueue[targetNumber]
         if (!targetJid || !pendingKeys[targetJid]) {
-            await sendSafeMessage(sock, creatorNumber, {
+            await sendSafeMessage(sock, creatorJid, {
                 text:
                     `⚠️ *No active request found for* \`${targetNumber}\`\n\n` +
                     `The session may have already expired or been denied.`
@@ -450,13 +430,12 @@ async function handleAdminCommand(ctx) {
         if (Date.now() > session.expiresAt) {
             delete pendingKeys[targetJid]
             delete approvalQueue[targetNumber]
-            await sendSafeMessage(sock, creatorNumber, {
+            await sendSafeMessage(sock, creatorJid, {
                 text: `⏰ *Too late* — the session for \`${targetNumber}\` already expired.`
             })
             return
         }
 
-        // Send the key to the requester — branded Sky Graphics delivery
         try {
             await sendSafeMessage(sock, targetJid, {
                 text:
@@ -475,13 +454,13 @@ async function handleAdminCommand(ctx) {
                     `_WRG Bot · Sky Graphics_ 🎨`
             })
 
-            await sendSafeMessage(sock, creatorNumber, {
+            await sendSafeMessage(sock, creatorJid, {
                 text:
                     `✅ *Key delivered to* \`${targetNumber}\`\n\n` +
                     `They now have until the 10-minute window closes to activate. ⏱️`
             })
         } catch (err) {
-            await sendSafeMessage(sock, creatorNumber, {
+            await sendSafeMessage(sock, creatorJid, {
                 text: `⚠️ *Could not deliver key to* \`${targetNumber}\`: ${err.message}`
             })
         }
@@ -492,11 +471,11 @@ async function handleAdminCommand(ctx) {
     //  /deny [number] — CREATOR ONLY
     // ══════════════════════════════════════════════
     if (cmd[0] === 'deny') {
-        if (!senderIsCreator) return  // total silence
+        if (!senderIsCreator) return
 
         const targetNumber = (cmd[1] || '').replace(/[^0-9]/g, '')
         if (!targetNumber) {
-            await sendSafeMessage(sock, creatorNumber, {
+            await sendSafeMessage(sock, creatorJid, {
                 text: `⚠️ Usage: \`/deny [number]\``
             })
             return
@@ -504,7 +483,7 @@ async function handleAdminCommand(ctx) {
 
         const targetJid = approvalQueue[targetNumber]
         if (!targetJid || !pendingKeys[targetJid]) {
-            await sendSafeMessage(sock, creatorNumber, {
+            await sendSafeMessage(sock, creatorJid, {
                 text:
                     `⚠️ *No active request found for* \`${targetNumber}\`\n\n` +
                     `Already expired, approved, or never requested.`
@@ -512,11 +491,9 @@ async function handleAdminCommand(ctx) {
             return
         }
 
-        // Void immediately
         delete pendingKeys[targetJid]
         delete approvalQueue[targetNumber]
 
-        // Notify the requester — no reason given (security: don't leak info)
         try {
             await sendSafeMessage(sock, targetJid, {
                 text:
@@ -528,7 +505,7 @@ async function handleAdminCommand(ctx) {
             })
         } catch (_) {}
 
-        await sendSafeMessage(sock, creatorNumber, {
+        await sendSafeMessage(sock, creatorJid, {
             text:
                 `🚫 *Request denied and key voided.*\n\n` +
                 `\`${targetNumber}\` has been notified without details. 🔒`
@@ -538,20 +515,16 @@ async function handleAdminCommand(ctx) {
 
     // ══════════════════════════════════════════════
     //  /help — admin + creator only, DM only
-    //  Total silence for everyone else — no exceptions
     // ══════════════════════════════════════════════
     if (cmd[0] === 'help') {
         if (senderIsCreator) {
-            // Creator always gets full dashboard to their own DM
             await sendSafeMessage(sock, senderJid, { text: buildHelpText(settings, true) })
             return
         }
         if (isAdmin) {
-            // Confirmed admin gets dashboard to their own DM
             await sendSafeMessage(sock, senderJid, { text: buildHelpText(settings, false) })
             return
         }
-        // Everyone else — absolute silence
         return
     }
 
@@ -560,8 +533,8 @@ async function handleAdminCommand(ctx) {
     // ══════════════════════════════════════════════
     if (!senderIsCreator && !isAdmin) return
 
-    // Determine reply target
-    const replyTo = senderIsCreator ? creatorNumber : adminJid
+    // FIX BUG-14: always reply to senderJid — whoever sent the command
+    const replyTo = senderJid
 
     // ─── /set difficulty ─────────────────────────
     if (cmd[0] === 'set' && cmd[1] === 'difficulty') {
@@ -606,7 +579,6 @@ async function handleAdminCommand(ctx) {
             settings.adminNumber = confirmed.number
             settings.adminJid    = ''
             saveSettings()
-            // Start inactivity watchdog for the new admin
             startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
             await sendSafeMessage(sock, replyTo, {
                 text:
@@ -792,8 +764,7 @@ async function handleAdminCommand(ctx) {
     if (cmd[0] === 'clearwords') {
         const level = cmd[1]
         if (['easy', 'normal', 'difficult'].includes(level)) {
-            // Guard: refuse if this is the only pool with words left
-            const otherLevels = ['easy', 'normal', 'difficult'].filter(l => l !== level)
+            const otherLevels   = ['easy', 'normal', 'difficult'].filter(l => l !== level)
             const otherHasWords = otherLevels.some(l => words[l] && words[l].length > 0)
             if (!otherHasWords) {
                 await sendSafeMessage(sock, replyTo, {
@@ -909,6 +880,7 @@ async function handleAdminCommand(ctx) {
 
     // ─── /status ─────────────────────────────────
     if (cmd[0] === 'status') {
+        // FIX BUG-13: pass games as second arg to getGameState
         const activeGameChat = activeGameChatRef.value
         if (!activeGameChat) {
             await sendSafeMessage(sock, replyTo, {
@@ -923,7 +895,7 @@ async function handleAdminCommand(ctx) {
                     `› Admin: *${settings.adminNumber || 'None'}*`
             })
         } else {
-            const gs = getGameState(activeGameChat)
+            const gs = getGameState(activeGameChat, games)
             let statusText = `📊 *WRG Bot Status*\n\n`
 
             if (gs.lobbyActive) {
@@ -964,7 +936,8 @@ async function handleAdminCommand(ctx) {
         if (!activeGameChat) {
             await sendSafeMessage(sock, replyTo, { text: `⚠️ No active game to pause right now.` })
         } else {
-            const gs = getGameState(activeGameChat)
+            // FIX BUG-13: pass games to getGameState
+            const gs = getGameState(activeGameChat, games)
             if (gs.active && !gs.paused) {
                 gs.paused = true
                 persistGames()
@@ -985,7 +958,8 @@ async function handleAdminCommand(ctx) {
         if (!activeGameChat) {
             await sendSafeMessage(sock, replyTo, { text: `⚠️ No active game to resume right now.` })
         } else {
-            const gs = getGameState(activeGameChat)
+            // FIX BUG-13: pass games to getGameState
+            const gs = getGameState(activeGameChat, games)
             if (gs.active && gs.paused) {
                 gs.paused = false
                 persistGames()
@@ -993,7 +967,10 @@ async function handleAdminCommand(ctx) {
                 await sock.sendMessage(activeGameChat, {
                     text: `▶️ *Game resumed by the admin!* Back in action — keep guessing! 🔥`
                 })
-                startTurnCountdown(activeGameChat)
+                // FIX BUG-12: pass both chatId and a valid ctx to startTurnCountdown
+                startTurnCountdown(activeGameChat, {
+                    sock, games, settings, activeGameChatRef, persistGames, nameCache: ctx.nameCache
+                })
             } else {
                 await sendSafeMessage(sock, replyTo, {
                     text: `⚠️ Game is not currently paused.`
@@ -1007,7 +984,8 @@ async function handleAdminCommand(ctx) {
         if (!activeGameChat) {
             await sendSafeMessage(sock, replyTo, { text: `⚠️ No active game or lobby to end right now.` })
         } else {
-            const gs        = getGameState(activeGameChat)
+            // FIX BUG-13: pass games to getGameState
+            const gs        = getGameState(activeGameChat, games)
             const endedChat = activeGameChat
             gs.active = false
             gs.lobbyActive = false
@@ -1027,7 +1005,7 @@ async function handleAdminCommand(ctx) {
         return
     }
 
-    // Unknown command — absolute silence (never hint at what exists)
+    // Unknown command — absolute silence
 }
 
 module.exports = { handleAdminCommand }

@@ -32,24 +32,42 @@ function difficultyBadge(difficulty) {
 
 // ─── Tier resolution ──────────────────────────────────────────
 /**
- * Resolve the tier of a sender by their plain phone number.
- * Always pass the resolved PN (from msg.key.senderPn), never a JID.
+ * Resolve the tier of a sender.
  *
  * @param {string} senderNumber  — plain digits, e.g. "237682477421"
  * @param {object} settings      — { adminNumber }
+ * @param {string} [senderJid]  — optional full JID; used as LID fallback
+ *                                 so creator is recognised even when
+ *                                 WhatsApp routes via @lid instead of @s.whatsapp.net
  * @returns {'CREATOR'|'ADMIN'|'PUBLIC'}
+ *
+ * FIX BUG-22: added senderJid as optional third arg with LID fallback
  */
-function getTier(senderNumber, settings) {
+function getTier(senderNumber, settings, senderJid) {
     const clean = (senderNumber || '').replace(/[^0-9]/g, '')
 
     // Creator check — compare plain numbers only, never JIDs
     const creatorJid = process.env.CREATOR_JID || ''
     const creatorNum = creatorJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
+
     if (creatorNum && clean === creatorNum) return TIERS.CREATOR
+
+    // LID fallback: extract number from the JID suffix and compare
+    // handles the case where senderNumber is a LID digit string
+    if (senderJid) {
+        const jidNum = senderJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
+        if (creatorNum && jidNum && jidNum === creatorNum) return TIERS.CREATOR
+    }
 
     // Admin check
     const adminNum = (settings.adminNumber || '').replace(/[^0-9]/g, '')
     if (adminNum && clean === adminNum) return TIERS.ADMIN
+
+    // Admin LID fallback
+    if (senderJid && adminNum) {
+        const jidNum = senderJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
+        if (jidNum && jidNum === adminNum) return TIERS.ADMIN
+    }
 
     return TIERS.PUBLIC
 }
@@ -57,17 +75,17 @@ function getTier(senderNumber, settings) {
 /**
  * Convenience booleans — use these everywhere instead of inline string compares.
  */
-function isCreator(senderNumber, settings) {
-    return getTier(senderNumber, settings) === TIERS.CREATOR
+function isCreator(senderNumber, settings, senderJid) {
+    return getTier(senderNumber, settings, senderJid) === TIERS.CREATOR
 }
 
-function isAdmin(senderNumber, settings) {
-    const tier = getTier(senderNumber, settings)
+function isAdmin(senderNumber, settings, senderJid) {
+    const tier = getTier(senderNumber, settings, senderJid)
     return tier === TIERS.CREATOR || tier === TIERS.ADMIN
 }
 
-function isPublic(senderNumber, settings) {
-    return getTier(senderNumber, settings) === TIERS.PUBLIC
+function isPublic(senderNumber, settings, senderJid) {
+    return getTier(senderNumber, settings, senderJid) === TIERS.PUBLIC
 }
 
 // ─── Command permission map ───────────────────────────────────
@@ -93,7 +111,10 @@ const COMMAND_TIERS = {
     setwords:     TIERS.ADMIN,
     clearwords:   TIERS.ADMIN,
     setallwords:  TIERS.ADMIN,
-    set:          TIERS.ADMIN,  // /set difficulty, /set public, /set start, /set maxtries, /set admin
+    set:          TIERS.ADMIN,
+    // FIX BUG-18: clearadmin and status were missing from COMMAND_TIERS
+    clearadmin:   TIERS.ADMIN,
+    status:       TIERS.ADMIN,
 
     // Public — anyone (onboarding gate)
     admin: TIERS.PUBLIC
@@ -102,13 +123,10 @@ const COMMAND_TIERS = {
 /**
  * Returns true if the given tier is allowed to run the command.
  * Creator can always run admin commands.
- *
- * @param {string} tier    — one of TIERS.*
- * @param {string} command — e.g. "help", "approve", "set"
  */
 function canRunCommand(tier, command) {
     const required = COMMAND_TIERS[command]
-    if (!required) return false  // unknown command — deny by default
+    if (!required) return false
 
     if (required === TIERS.PUBLIC)   return true
     if (required === TIERS.ADMIN)    return tier === TIERS.ADMIN || tier === TIERS.CREATOR
@@ -120,35 +138,21 @@ function canRunCommand(tier, command) {
 /**
  * Resolve the effective value for a setting key.
  * Creator overrides always win. Admin settings are the tenant layer.
- * Falls back to hardcoded defaults.
- *
- * @param {string} key           — e.g. "difficulty", "publicVisible"
- * @param {object} settings      — the main settings object (has adminSettings + creatorOverrides)
- * @param {any}    defaultValue  — fallback if neither layer has a value
  */
 function resolveSetting(key, settings, defaultValue) {
-    // Creator overrides always win
     if (
         settings.creatorOverrides &&
         settings.creatorOverrides[key] !== undefined
     ) {
         return settings.creatorOverrides[key]
     }
-    // Admin tenant setting
     if (settings[key] !== undefined) return settings[key]
-    // Hardcoded default
     return defaultValue
 }
 
 /**
  * Write a setting. Creator writes to creatorOverrides (global).
  * Admin writes to root settings (tenant-scoped).
- * This means creator can override admin but not vice versa.
- *
- * @param {string} tier      — TIERS.CREATOR or TIERS.ADMIN
- * @param {string} key
- * @param {any}    value
- * @param {object} settings  — mutated in place; call saveSettings() after
  */
 function writeSetting(tier, key, value, settings) {
     if (tier === TIERS.CREATOR) {
@@ -162,15 +166,9 @@ function writeSetting(tier, key, value, settings) {
 // ─── Reply target resolution ──────────────────────────────────
 /**
  * Returns the JID that all command replies should go to for this sender.
- * Commands ALWAYS reply to the sender's own DM, never to the group.
- *
- * @param {string} tier         — TIERS.*
- * @param {string} senderJid    — the sender's resolved JID (from index.js)
- * @param {object} settings     — { adminJid }
- * @returns {string}            — JID to send reply to
+ * Commands ALWAYS reply to the sender's own DM.
  */
 function getReplyTarget(tier, senderJid, settings) {
-    // Always reply to whoever sent the command — no relaying through creator
     return senderJid
 }
 
@@ -183,13 +181,9 @@ function getReplyTarget(tier, senderJid, settings) {
  *   "Might Awa (Creator)"
  *   "John (Admin)"
  *   "Sarah"
- *
- * @param {string} number     — player's phone number (plain digits)
- * @param {object} nameCache  — { [number]: name }
- * @param {object} settings   — { adminNumber } — optional, pass when available
  */
 function nameTag(number, nameCache, settings) {
-    const name = nameCache[number] || 'Player'
+    const name = (nameCache && nameCache[number]) || 'Player'
 
     const creatorJid = process.env.CREATOR_JID || ''
     const creatorNum = creatorJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')

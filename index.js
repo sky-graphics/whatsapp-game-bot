@@ -22,19 +22,12 @@ const {
 } = require('./gameEngine')
 
 const {
-    getTier, isAdmin: isAdminFn, nameTag, difficultyBadge, TIERS
+    getTier, nameTag, difficultyBadge, TIERS
 } = require('./permissions')
 
 const { handleAdminCommand } = require('./adminCommands')
 
 // ─── Safe DM sender ───────────────────────────────────────
-// WhatsApp lets you message a contact using EITHER their LID or their
-// phone-number JID once a session exists between you (which is always
-// true here — the creator/admin/requester has already messaged the bot
-// before the bot ever needs to reply). No mapping table, no cache, no
-// external store required — just normalize a bare number into a JID
-// and send. If a live JID was already captured from an inbound message,
-// pass that straight through unchanged.
 async function sendSafeMessage(sock, jidOrNumber, payload) {
     const targetJid = jidOrNumber.includes('@') ? jidOrNumber : `${jidOrNumber}@s.whatsapp.net`
     try {
@@ -47,27 +40,27 @@ async function sendSafeMessage(sock, jidOrNumber, payload) {
 
 // ─── Persistent Settings ───────────────────────────────────
 const SETTINGS_FILE = 'settings.json'
-const WORDS_FILE = 'words.json'
-const GAMES_FILE = 'games.json'
+const WORDS_FILE    = 'words.json'
+const GAMES_FILE    = 'games.json'
 
 let settings = {
-    adminNumber: '',
-    adminJid: '',
-    difficulty: 'easy',
-    maxTries: 10,
-    prefix: 'wrg',
-    adminPrefix: '/',
-    publicVisible: true,
+    adminNumber:    '',
+    adminJid:       '',
+    difficulty:     'easy',
+    maxTries:       10,
+    prefix:         'wrg',
+    adminPrefix:    '/',
+    publicVisible:  true,
     publicCanStart: false
 }
 
-let pendingAdminChangeRef = { value: null }  // { number }
+let pendingAdminChangeRef = { value: null }
 
 if (fs.existsSync(SETTINGS_FILE)) {
     settings = JSON.parse(fs.readFileSync(SETTINGS_FILE))
-    if (typeof settings.adminJid === 'undefined') settings.adminJid = ''
-    if (typeof settings.publicVisible === 'undefined') settings.publicVisible = true
-    if (typeof settings.publicCanStart === 'undefined') {
+    if (typeof settings.adminJid        === 'undefined') settings.adminJid        = ''
+    if (typeof settings.publicVisible   === 'undefined') settings.publicVisible   = true
+    if (typeof settings.publicCanStart  === 'undefined') {
         settings.publicCanStart = typeof settings.publicStart !== 'undefined' ? settings.publicStart : false
         delete settings.publicStart
     }
@@ -96,32 +89,21 @@ function displayName(number) {
     return nameCache[number] || number
 }
 
-function tag(number) {
-    return `@${displayName(number)}`
-}
-
 function jidOf(number) {
     if (!number) return ''
     if (number.includes('@')) return number
     return `${number}@s.whatsapp.net`
 }
 
-// Resolve the correct full JID for mentions — uses stored playerJids map first
-// so LID players get @lid JID not @s.whatsapp.net
 function resolveJid(number, playerJids) {
     if (!number) return ''
     if (number.includes('@')) return number
     return (playerJids && playerJids[number]) || `${number}@s.whatsapp.net`
 }
 
-// ─── Idempotency guard (in-memory — no external store needed) ──
-// During WhatsApp's LID migration, the same message can occasionally
-// arrive as two separate 'notify' events. This keeps a short-lived record
-// of message IDs already handled so a single typed command can't trigger
-// a command twice. Self-cleaning, bounded by the time window — not a
-// persistent store, just a few minutes of recent message IDs in memory.
-const recentlySeenIds = new Map() // msgId → timestamp
-const DEDUP_WINDOW_MS = 2 * 60 * 1000
+// ─── Idempotency guard ─────────────────────────────────────
+const recentlySeenIds  = new Map()
+const DEDUP_WINDOW_MS  = 2 * 60 * 1000
 
 function isDuplicateMessage(msgId) {
     if (!msgId) return false
@@ -147,7 +129,7 @@ if (fs.existsSync(WORDS_FILE)) {
 
 // ─── Game State ────────────────────────────────────────────
 const games = {}
-let activeGameChatRef = { value: null }  // wraps activeGameChat so modules can mutate it
+let activeGameChatRef = { value: null }
 
 function persistGames() {
     const serializable = {}
@@ -169,7 +151,7 @@ function loadPersistedGames() {
             games[chatId] = {
                 ...data.games[chatId],
                 lobbyTimer: null,
-                turnTimer: null
+                turnTimer:  null
             }
         }
     } catch (err) {
@@ -179,10 +161,12 @@ function loadPersistedGames() {
 
 loadPersistedGames()
 
-// Boot flag — prevents spamming admin DM on Baileys internal reconnects
 let hasSentBootAdminConfirmation = false
 
 // ─── Shared engine context builder ─────────────────────────
+// FIX BUG-05: nameCache is now included so gameEngine.startTurnCountdown
+// can use it for player name display during turn warnings.
+// FIX BUG-05: removed jidOf and tag — gameEngine uses nameTag from permissions.js
 function buildCtx(sock) {
     return {
         sock,
@@ -191,8 +175,7 @@ function buildCtx(sock) {
         words,
         activeGameChatRef,
         persistGames,
-        jidOf,
-        tag,
+        nameCache,
         DEFAULT_WORDS
     }
 }
@@ -202,9 +185,9 @@ async function startBot() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info')
 
     const sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: false,
-        getMessage: async () => ({ conversation: '' })
+        auth:                state,
+        printQRInTerminal:   false,
+        getMessage:          async () => ({ conversation: '' })
     })
 
     sock.ev.on('creds.update', saveCreds)
@@ -219,7 +202,7 @@ async function startBot() {
         }
 
         if (connection === 'close') {
-            const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode
+            const statusCode      = new Boom(lastDisconnect?.error)?.output?.statusCode
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut
             if (shouldReconnect) {
                 console.log('🔁 Connection closed. Restarting and generating a fresh QR...')
@@ -232,11 +215,31 @@ async function startBot() {
         if (connection === 'open') {
             console.log('✅ WRG Bot is connected! 🎮')
 
-            // Boot confirmation DM to admin (once per process)
+            // FIX BUG-09: boot DM to creator as well as admin
             if (!hasSentBootAdminConfirmation) {
                 hasSentBootAdminConfirmation = true
+                const creatorJid = process.env.CREATOR_JID || ''
+
+                // Always notify creator
+                if (creatorJid) {
+                    try {
+                        await sendSafeMessage(sock, creatorJid, {
+                            text:
+                                `🔁 *WRG Bot is back online!* ✅\n\n` +
+                                `👑 You're the *Creator* (unrestricted access).\n\n` +
+                                `Type */help* to open your full dashboard.\n\n` +
+                                `_WRG Bot · by Sky Graphics_ 🎨`
+                        })
+                        console.log(`🔐 Sent boot DM to creator`)
+                    } catch (err) {
+                        console.log('⚠️ Could not DM creator on boot:', err.message)
+                    }
+                }
+
+                // Also notify admin if set and different from creator
                 const bootTarget = settings.adminJid || settings.adminNumber
-                if (bootTarget) {
+                const creatorNum = creatorJid.split('@')[0].split(':')[0]
+                if (bootTarget && settings.adminNumber !== creatorNum) {
                     try {
                         await sendSafeMessage(sock, bootTarget, {
                             text:
@@ -245,18 +248,18 @@ async function startBot() {
                                 `Type */help* at any time to see all your commands.\n\n` +
                                 `_WRG Bot · by Sky Graphics_ 🎨`
                         })
-                        console.log(`👑 Sent boot confirmation DM to admin ${bootTarget}`)
+                        console.log(`👑 Sent boot DM to admin ${bootTarget}`)
                     } catch (err) {
-                        console.log('⚠️ Could not DM the admin on boot:', err.message)
+                        console.log('⚠️ Could not DM admin on boot:', err.message)
                     }
-                } else {
+                } else if (!bootTarget && !creatorJid) {
                     console.log('ℹ️ No admin set yet. Someone must type /admin to begin onboarding.')
                 }
             }
 
             // Recover active game/lobby after restart
             if (activeGameChatRef.value && games[activeGameChatRef.value]) {
-                const gs = games[activeGameChatRef.value]
+                const gs  = games[activeGameChatRef.value]
                 const ctx = buildCtx(sock)
                 if (gs.lobbyActive) {
                     await sock.sendMessage(activeGameChatRef.value, {
@@ -284,10 +287,8 @@ async function startBot() {
         for (const msg of messages) {
             if (!msg.message) continue
 
-            // Skip if this exact message was already processed (see
-            // isDuplicateMessage above)
             if (isDuplicateMessage(msg.key?.id)) {
-                console.log(`[dedup] Skipping duplicate delivery of message: ${msg.key.id}`)
+                console.log(`[dedup] Skipping duplicate: ${msg.key.id}`)
                 continue
             }
 
@@ -300,26 +301,16 @@ async function startBot() {
                 msg.message?.imageMessage?.caption ||
                 msg.message?.videoMessage?.caption ||
                 ''
-            const body = text.trim().toLowerCase()
+            const body    = text.trim().toLowerCase()
             const rawBody = text.trim()
 
             const sender = msg.key.participant || msg.key.remoteJid || ''
 
-            // ── senderNumber resolution ──────────────────────────────────────────
-            // Priority 1: msg.key.senderPn — Baileys' explicit phone-number field.
-            // Priority 2: fromMe — the message is from the bot's own account, which
-            //   is always the creator. Use CREATOR_JID so the number is correct even
-            //   when senderPn is absent (common in many Baileys builds for outbound msgs).
-            // Priority 3: strip @-suffix and device tag from whatever JID we have.
-            //   NOTE: this fallback can be a @lid identifier (not a phone number) on
-            //   newer WhatsApp multidevice accounts — the comparison in isCreator()
-            //   will then silently fail. Priorities 1 and 2 avoid that for the creator.
+            // ── senderNumber resolution ──────────────────────
             let senderNumber
             if (msg.key.senderPn) {
                 senderNumber = msg.key.senderPn.split('@')[0].split(':')[0]
             } else if (msg.key.fromMe) {
-                // fromMe = this is our own account = the creator.
-                // Derive the number from CREATOR_JID so isCreator() matches correctly.
                 const creatorJid = process.env.CREATOR_JID || ''
                 senderNumber = creatorJid
                     ? creatorJid.split('@')[0].split(':')[0]
@@ -328,10 +319,7 @@ async function startBot() {
                 senderNumber = sender.split('@')[0].split(':')[0]
             }
 
-            // ── senderJid: the JID we can actually send a DM back to ─────────────
-            // In a group, msg.key.participant is the sender's JID.
-            // In a fromMe DM, msg.key.participant is undefined and remoteJid is the
-            // chat partner — both are wrong for replying TO the creator. Use CREATOR_JID.
+            // ── senderJid: the JID to DM this sender ─────────
             const senderJid = msg.key.fromMe
                 ? (process.env.CREATOR_JID || (senderNumber ? `${senderNumber}@s.whatsapp.net` : sender))
                 : (msg.key.participant || sender)
@@ -339,16 +327,16 @@ async function startBot() {
             const senderName = msg.pushName || senderNumber
             rememberName(senderNumber, msg.pushName)
 
-            const isAdmin = msg.key.fromMe || senderNumber === settings.adminNumber || settings.adminNumber === ''
+            // FIX BUG-01 + BUG-02: compute tier via getTier so permissions.js is the
+            // single source of truth. senderTier replaces the old inline isAdmin check.
+            const senderTier   = getTier(senderNumber, settings, senderJid)
+            const isAdmin      = senderTier === TIERS.CREATOR || senderTier === TIERS.ADMIN
 
-            // Non-admins are invisible to the bot unless publicVisible is on —
-            // EXCEPT for slash-commands (adminPrefix), which must always reach
-            // adminCommands.js so the /admin key-request onboarding flow works
-            // even when publicVisible is off. adminCommands.js handles its own
-            // per-command permission gates internally.
+            // Non-admins invisible unless publicVisible is on —
+            // EXCEPT slash-commands (always reach adminCommands for onboarding)
             if (!isAdmin && !settings.publicVisible && !body.startsWith(settings.adminPrefix)) continue
 
-            // Refresh admin name + JID on every message from admin
+            // Refresh admin JID on every inbound admin message
             if (senderNumber === settings.adminNumber) {
                 if (msg.pushName) rememberName(settings.adminNumber, msg.pushName)
                 if (sender && sender !== settings.adminJid) {
@@ -366,8 +354,10 @@ async function startBot() {
                     saveSettings,
                     saveWords,
                     sendSafeMessage,
-                    getGameState: (chatId) => getGameState(chatId, games),
-                    startTurnCountdown: (chatId) => startTurnCountdown(chatId, buildCtx(sock)),
+                    // FIX BUG-03: correct 2-arg signature
+                    getGameState: (chatId, g) => getGameState(chatId, g || games),
+                    // FIX BUG-12: pass full ctx so resume works
+                    startTurnCountdown: (chatId, overrideCtx) => startTurnCountdown(chatId, overrideCtx || buildCtx(sock)),
                     DEFAULT_WORDS,
                     fs,
                     senderNumber,
@@ -376,6 +366,7 @@ async function startBot() {
                     sender: from,
                     body,
                     isAdmin,
+                    // FIX BUG-01: senderTier is now always defined here
                     senderTier
                 }
                 await handleAdminCommand(ctx)
@@ -384,7 +375,7 @@ async function startBot() {
 
             // ── WRG (all caps) = start lobby ────────────────
             const isAllCapsWRG = rawBody === 'WRG'
-            const isMixedWRG = !isAllCapsWRG && rawBody.toUpperCase() === 'WRG'
+            const isMixedWRG   = !isAllCapsWRG && rawBody.toUpperCase() === 'WRG'
 
             if (isMixedWRG) {
                 const pingStart = Date.now()
@@ -432,7 +423,6 @@ async function startBot() {
                         await sock.sendMessage(from, {
                             text: `⚠️ A game is currently running in another chat. It must end before a new one can start.`
                         })
-                        // DM admin so they're aware (item 9)
                         const adminTarget = settings.adminJid || settings.adminNumber
                         if (adminTarget) {
                             try {
@@ -448,16 +438,17 @@ async function startBot() {
                     continue
                 }
 
-                const gameState = getGameState(from, games, settings)
-                gameState.lobbyActive = true
+                // FIX BUG-03: 2-arg call
+                const gameState = getGameState(from, games)
+                gameState.lobbyActive     = true
                 gameState.lobbySecondsLeft = 60
-                gameState.players = []
-                gameState.playerNames = {}
-                gameState.playerJids = {}
-                gameState.skipStreaks = {}
-                gameState.disqualified = []
+                gameState.players         = []
+                gameState.playerNames     = {}
+                gameState.playerJids      = {}
+                gameState.skipStreaks     = {}
+                gameState.disqualified    = []
 
-                // Creator always auto-joins via CREATOR_JID
+                // Creator always auto-joins
                 const creatorEnvJid = process.env.CREATOR_JID || ''
                 const creatorNum    = creatorEnvJid ? creatorEnvJid.split('@')[0].split(':')[0] : ''
                 if (creatorNum && !gameState.players.includes(creatorNum)) {
@@ -472,8 +463,10 @@ async function startBot() {
                     gameState.playerJids[settings.adminNumber]  = settings.adminJid || `${settings.adminNumber}@s.whatsapp.net`
                 }
                 const autoJoinMentions = gameState.players.map(num => gameState.playerJids[num] || jidOf(num))
+
+                // FIX BUG-07: use nameTag for auto-join display
                 const autoJoinText = gameState.players.length > 0
-                    ? gameState.players.map((num, i) => `${i + 1}. @${num} (${gameState.playerNames[num] || num}) — Auto-joined 👑`).join('\n')
+                    ? gameState.players.map((num, i) => `${i + 1}. ${nameTag(num, nameCache, settings)} — Auto-joined 👑`).join('\n')
                     : '[No players yet — be first! 🎯]'
 
                 const difficulty = settings.difficulty || 'easy'
@@ -495,9 +488,10 @@ async function startBot() {
 
             // ── wrg join / wrg start / wrg help ─────────────
             if (body.startsWith(settings.prefix)) {
-                const parts = body.split(' ')
-                const subCmd = parts[1]
-                const gameState = getGameState(from, games, settings)
+                const parts   = body.split(' ')
+                const subCmd  = parts[1]
+                // FIX BUG-03: 2-arg call
+                const gameState = getGameState(from, games)
 
                 if (subCmd === 'join') {
                     if (!gameState.lobbyActive) {
@@ -509,16 +503,17 @@ async function startBot() {
                     if (!gameState.players.includes(senderNumber)) {
                         gameState.players.push(senderNumber)
                         gameState.playerNames[senderNumber] = senderName
-                        gameState.playerJids[senderNumber] = senderJid
+                        gameState.playerJids[senderNumber]  = senderJid
 
                         const lobbyMentions = gameState.players.map(num => resolveJid(num, gameState.playerJids))
-                        const lobbyText = gameState.players
-                            .map((num, i) => `${i + 1}. @${displayName(num)} (${gameState.playerNames[num] || num})`)
+                        const lobbyText     = gameState.players
+                            .map((num, i) => `${i + 1}. ${nameTag(num, gameState.playerNames, settings)}`)
                             .join('\n')
 
+                        // FIX BUG-06: use nameTag for join message
                         await sock.sendMessage(from, {
                             text:
-                                `✅ *@${senderNumber} (${senderName}) joined the lobby!* 🎉\n\n` +
+                                `✅ *${nameTag(senderNumber, nameCache, settings)} joined the lobby!* 🎉\n\n` +
                                 `👥 *Current Lobby:*\n${lobbyText}\n\n` +
                                 `_Type *wrg join* to hop in!_ ⏱️`,
                             mentions: [...new Set([resolveJid(senderNumber, gameState.playerJids), ...lobbyMentions])]
@@ -563,17 +558,17 @@ async function startBot() {
             }
 
             // ── Active game play ────────────────────────────
-            const gameState = getGameState(from, games, settings)
+            // FIX BUG-03: 2-arg call
+            const gameState = getGameState(from, games)
             if (gameState.active && !gameState.paused) {
                 const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
-                const isPlayerTurn = senderNumber === currentPlayerNumber
-                const isAdminBypass = isAdmin && !gameState.players.includes(senderNumber)
+                const isPlayerTurn        = senderNumber === currentPlayerNumber
+                const isAdminBypass       = isAdmin && !gameState.players.includes(senderNumber)
 
                 if (isPlayerTurn || isAdminBypass) {
                     gameState.skipStreaks[currentPlayerNumber] = 0
 
                     if (body.length === 1) {
-                        // Letter guess
                         let foundIndex = -1
                         for (let i = 0; i < gameState.targetWord.length; i++) {
                             if (gameState.targetWord[i] === body && gameState.hiddenWord[i] === '_') {
@@ -589,52 +584,52 @@ async function startBot() {
 
                             if (!gameState.hiddenWord.includes('_')) {
                                 // Victory!
-                                gameState.active = false
+                                gameState.active        = false
                                 activeGameChatRef.value = null
                                 await sock.sendMessage(from, {
                                     text: `🎉 *VICTORY!* The word was *${gameState.targetWord.toUpperCase()}*! Well done! 🏆`
                                 })
-                                await matchSummary.sendMatchReport(sock, from, gameState, { type: 'winner_letter', winnerNumber: senderNumber }, tag)
+                                // FIX BUG-08: pass nameTag lambda so match report shows role badges
+                                await matchSummary.sendMatchReport(
+                                    sock, from, gameState,
+                                    { type: 'winner_letter', winnerNumber: senderNumber },
+                                    (n) => nameTag(n, nameCache, settings)
+                                )
                                 gameState.players = []
                                 persistGames()
                             } else {
                                 const nextTurnIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
                                 gameState.currentTurnIndex = nextTurnIndex
 
+                                // FIX BUG-04: use nameTag not tag()
                                 const feedback =
                                     `✅ *Correct!*\n` +
-                                    `${tag(senderNumber)} guessed *${body.toUpperCase()}* and revealed the first occurrence! 🟢`
+                                    `${nameTag(senderNumber, nameCache, settings)} guessed *${body.toUpperCase()}* and revealed the first occurrence! 🟢`
                                 await sendGameBoard(from, feedback, [resolveJid(senderNumber, gameState.playerJids)], buildCtx(sock))
                             }
                         } else {
-                            // Wrong letter — track per-player
                             gameState.attempts[currentPlayerNumber] = (gameState.attempts[currentPlayerNumber] || 0) + 1
 
+                            // FIX BUG-04: use nameTag not tag()
                             const feedback =
                                 `❌ *Wrong guess!*\n` +
-                                `${tag(senderNumber)} guessed *${body.toUpperCase()}* — not in the word. 🔴\n` +
+                                `${nameTag(senderNumber, nameCache, settings)} guessed *${body.toUpperCase()}* — not in the word. 🔴\n` +
                                 `_(${gameState.attempts[currentPlayerNumber]}/${settings.maxTries} wrong guesses for this player)_`
 
                             if (gameState.attempts[currentPlayerNumber] >= settings.maxTries) {
-                                // This player has exhausted their attempts — disqualify them
-                                matchSummary.recordDisqualification(gameState, currentPlayerNumber, 'ATTEMPTS_EXHAUSTED')
+                                // FIX BUG-21: recordDisqualification now cleans up playerJids + attempts internally
+                                matchSummary.recordDisqualification(gameState, currentPlayerNumber, matchSummary.DQ_REASONS.ATTEMPTS_EXHAUSTED)
 
                                 const removedIndex = gameState.currentTurnIndex
-                                delete gameState.playerNames[currentPlayerNumber]
-                                delete gameState.skipStreaks[currentPlayerNumber]
-                                delete gameState.attempts[currentPlayerNumber]
-                                if (gameState.players.includes(currentPlayerNumber)) {
-                                    gameState.players.splice(gameState.players.indexOf(currentPlayerNumber), 1)
-                                }
 
                                 const dqFeedback =
                                     `${feedback}\n\n` +
                                     `🚫 *Disqualified!*\n` +
-                                    `${tag(currentPlayerNumber)} has used all *${settings.maxTries}* wrong guesses and has been eliminated. 💀`
+                                    `${nameTag(currentPlayerNumber, nameCache, settings)} has used all *${settings.maxTries}* wrong guesses and has been eliminated. 💀`
 
                                 const lastStanding = matchSummary.checkLastPlayerStanding(gameState)
                                 if (lastStanding) {
-                                    gameState.active = false
+                                    gameState.active        = false
                                     activeGameChatRef.value = null
                                     await sock.sendMessage(from, {
                                         text:
@@ -642,11 +637,16 @@ async function startBot() {
                                             `🏆 *LAST PLAYER STANDING!*\n` +
                                             `The word was *${gameState.targetWord.toUpperCase()}*. 🎉`
                                     })
-                                    await matchSummary.sendMatchReport(sock, from, gameState, { type: 'last_standing', winnerNumber: lastStanding }, tag)
+                                    // FIX BUG-08
+                                    await matchSummary.sendMatchReport(
+                                        sock, from, gameState,
+                                        { type: 'last_standing', winnerNumber: lastStanding },
+                                        (n) => nameTag(n, nameCache, settings)
+                                    )
                                     gameState.players = []
                                     persistGames()
                                 } else if (gameState.players.length === 0) {
-                                    gameState.active = false
+                                    gameState.active        = false
                                     activeGameChatRef.value = null
                                     await sock.sendMessage(from, {
                                         text:
@@ -654,14 +654,18 @@ async function startBot() {
                                             `💀 *GAME OVER!* No players remain.\n` +
                                             `The word was *${gameState.targetWord.toUpperCase()}*.`
                                     })
-                                    await matchSummary.sendMatchReport(sock, from, gameState, { type: 'no_winner' }, tag)
+                                    // FIX BUG-08
+                                    await matchSummary.sendMatchReport(
+                                        sock, from, gameState,
+                                        { type: 'no_winner' },
+                                        (n) => nameTag(n, nameCache, settings)
+                                    )
                                     persistGames()
                                 } else {
                                     gameState.currentTurnIndex = removedIndex % gameState.players.length
                                     await sendGameBoard(from, dqFeedback, [], buildCtx(sock))
                                 }
                             } else {
-                                // Attempts not exhausted — rotate turn normally
                                 const nextTurnIndex = (gameState.currentTurnIndex + 1) % gameState.players.length
                                 gameState.currentTurnIndex = nextTurnIndex
                                 await sendGameBoard(from, feedback, [], buildCtx(sock))
@@ -670,12 +674,18 @@ async function startBot() {
                     } else if (body === gameState.targetWord) {
                         // Full word guess = instant win
                         if (gameState.turnTimer) clearInterval(gameState.turnTimer)
-                        gameState.active = false
+                        gameState.active        = false
                         activeGameChatRef.value = null
                         await sock.sendMessage(from, {
-                            text: `⚡ *INSTANT WIN!* ${tag(senderNumber)} guessed the full word *${gameState.targetWord.toUpperCase()}*! Incredible! 🎉🏆`
+                            // FIX BUG-04: use nameTag not tag()
+                            text: `⚡ *INSTANT WIN!* ${nameTag(senderNumber, nameCache, settings)} guessed the full word *${gameState.targetWord.toUpperCase()}*! Incredible! 🎉🏆`
                         })
-                        await matchSummary.sendMatchReport(sock, from, gameState, { type: 'winner_instant', winnerNumber: senderNumber }, tag)
+                        // FIX BUG-08
+                        await matchSummary.sendMatchReport(
+                            sock, from, gameState,
+                            { type: 'winner_instant', winnerNumber: senderNumber },
+                            (n) => nameTag(n, nameCache, settings)
+                        )
                         gameState.players = []
                         persistGames()
                     }
