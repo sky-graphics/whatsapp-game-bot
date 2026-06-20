@@ -101,6 +101,55 @@ function resolveJid(number, playerJids) {
     return (playerJids && playerJids[number]) || `${number}@s.whatsapp.net`
 }
 
+// ─── LID → PN cache ───────────────────────────────────────
+// WhatsApp now routes many messages via internal LIDs (e.g. 187733758767332@lid)
+// instead of real phone-number JIDs. This cache maps each LID to its real PN
+// so we never display or store a LID as if it were a phone number.
+// Persisted to lidcache.json so resolutions survive bot restarts.
+const LID_CACHE_FILE = 'lidcache.json'
+let lidCache = {}
+if (fs.existsSync(LID_CACHE_FILE)) {
+    try { lidCache = JSON.parse(fs.readFileSync(LID_CACHE_FILE)) } catch (_) {}
+}
+
+function saveLidCache() {
+    fs.writeFileSync(LID_CACHE_FILE, JSON.stringify(lidCache, null, 2))
+}
+
+// Resolves a LID to a real phone number.
+// First checks the local cache; if not found, queries WhatsApp servers via
+// sock.onWhatsApp() which always returns the real PN for any valid account.
+// Returns the plain PN string (e.g. "237682477421") or '' if unresolvable.
+async function resolvelidToPN(sock, lid) {
+    if (!lid || !lid.includes('@lid')) return ''
+
+    // Check cache first
+    if (lidCache[lid]) {
+        console.log(`[lid] Cache hit: ${lid} → ${lidCache[lid]}`)
+        return lidCache[lid]
+    }
+
+    // Query WhatsApp servers
+    try {
+        const results = await sock.onWhatsApp(lid)
+        if (results && results.length > 0) {
+            // onWhatsApp returns [{ jid, exists, ... }]
+            // The jid field is the real @s.whatsapp.net JID — strip domain to get PN
+            const realJid = results[0].jid || ''
+            const realPN  = realJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
+            if (realPN) {
+                lidCache[lid] = realPN
+                saveLidCache()
+                console.log(`[lid] Resolved: ${lid} → ${realPN}`)
+                return realPN
+            }
+        }
+    } catch (err) {
+        console.log(`[lid] Could not resolve ${lid}:`, err.message)
+    }
+    return ''
+}
+
 // ─── Idempotency guard ─────────────────────────────────────
 const recentlySeenIds  = new Map()
 const DEDUP_WINDOW_MS  = 2 * 60 * 1000
@@ -307,16 +356,51 @@ async function startBot() {
             const sender = msg.key.participant || msg.key.remoteJid || ''
 
             // ── senderNumber resolution ──────────────────────
+            // Rule: senderNumber must ALWAYS be a real phone number
+            // (country code + digits, e.g. "237682477421").
+            // A LID like "187733758767332" is NOT a phone number and must
+            // never be stored, displayed, or used as one.
+            //
+            // Priority 1 — senderPn: Baileys' explicit PN field. Always real.
+            // Priority 2 — fromMe: this is the bot's own account = creator.
+            //              Use CREATOR_JID so the number is always correct.
+            // Priority 3 — sender is a normal @s.whatsapp.net JID: strip domain.
+            // Priority 4 — sender is a @lid: look up real PN via cache or
+            //              sock.onWhatsApp() which queries WhatsApp's servers.
+            //              If unresolvable, skip this message entirely.
             let senderNumber
             if (msg.key.senderPn) {
-                senderNumber = msg.key.senderPn.split('@')[0].split(':')[0]
+                // Most reliable — Baileys populated the real PN directly
+                senderNumber = msg.key.senderPn.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
             } else if (msg.key.fromMe) {
+                // Message is from the bot's own account = always the creator
                 const creatorJid = process.env.CREATOR_JID || ''
                 senderNumber = creatorJid
-                    ? creatorJid.split('@')[0].split(':')[0]
-                    : sender.split('@')[0].split(':')[0]
+                    ? creatorJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
+                    : ''
+            } else if (sender && !sender.includes('@lid')) {
+                // Normal @s.whatsapp.net JID — number is in the JID itself
+                senderNumber = sender.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
+            } else if (sender && sender.includes('@lid')) {
+                // LID — resolve to real PN via cache or WhatsApp server query
+                senderNumber = await resolvelidToPN(sock, sender)
+                if (!senderNumber) {
+                    // Could not resolve — skip this message entirely.
+                    // Do NOT use LID digits as a phone number.
+                    console.log(`[lid] Skipping message — could not resolve LID: ${sender}`)
+                    continue
+                }
             } else {
-                senderNumber = sender.split('@')[0].split(':')[0]
+                // No sender info at all — skip
+                console.log('[senderNumber] No sender info — skipping message')
+                continue
+            }
+
+            // Final guard: if after all resolution senderNumber contains
+            // non-digit characters or is empty, skip — never display garbage.
+            if (!senderNumber || !/^[0-9]{7,15}$/.test(senderNumber)) {
+                console.log(`[senderNumber] Invalid PN resolved: "${senderNumber}" — skipping`)
+                continue
             }
 
             // ── senderJid: the JID to DM this sender ─────────
