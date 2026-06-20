@@ -175,13 +175,18 @@ async function handleAdminCommand(ctx) {
         pendingAdminChangeRef, saveSettings, saveWords, persistGames,
         sendSafeMessage, getGameState, startTurnCountdown,
         DEFAULT_WORDS, fs,
-        senderNumber, senderJid, senderName, body, senderTier
+        senderNumber, senderDisplayId, senderJid, senderName, body, senderTier
     } = ctx
 
     // requesterJid — always built from the plain phone number so the message
     // goes to the requester's own DM, never contaminated by CREATOR_JID.
     // This is what ensures /admin responses land in the correct person's DM.
     const requesterJid = senderNumber ? `${senderNumber}@s.whatsapp.net` : senderJid
+
+    // displayId — best available identifier to show in creator notifications
+    // and use as the approvalQueue key. Real PN when available, LID numeric
+    // part as fallback so /approve always has something to show and match.
+    const displayId = senderDisplayId || senderNumber || senderJid.split('@')[0].split(':')[0] || 'unknown'
 
     const creatorJid    = process.env.CREATOR_JID || ''
     const creatorNumber = creatorJid.split('@')[0].split(':')[0]
@@ -356,9 +361,10 @@ async function handleAdminCommand(ctx) {
             key: newKey,
             expiresAt: Date.now() + 10 * 60 * 1000,
             senderNumber,
+            displayId,
             senderName: reqName
         }
-        approvalQueue[senderNumber] = senderJid
+        approvalQueue[displayId] = senderJid  // key is displayId so /approve works even when PN unavailable
 
         await sendSafeMessage(sock, requesterJid, {
             text:
@@ -384,20 +390,20 @@ async function handleAdminCommand(ctx) {
                         `╚══════════════════════════╝\n\n` +
                         `Someone is requesting admin access to your bot.\n\n` +
                         `👤 *Name:* ${reqName}\n` +
-                        `📱 *Number:* \`${senderNumber}\`\n` +
+                        `📱 *ID:* \`${displayId}\`${!senderNumber ? ' ⚠️ _(LID — PN unavailable)_' : ''}\n` +
                         `🗝️ *Key:* \`${newKey}\`\n\n` +
                         `*What do you want to do?*\n\n` +
                         `✅ To *approve* and send them the key:\n` +
-                        `\`/approve ${senderNumber}\`\n\n` +
+                        `\`/approve ${displayId}\`\n\n` +
                         `❌ To *deny* and void the key immediately:\n` +
-                        `\`/deny ${senderNumber}\`\n\n` +
+                        `\`/deny ${displayId}\`\n\n` +
                         `_If you do nothing, the key auto-expires in 10 minutes._\n\n` +
                         `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
                         `_WRG Bot · Sky Graphics_ 🎨`
                 })
             } catch (err) {
                 console.log('⚠️ Could not DM creator with key request:', err.message)
-                console.log(`[FALLBACK] Admin key for ${senderNumber}: ${newKey}`)
+                console.log(`[FALLBACK] Admin key for ${displayId}: ${newKey}`)
             }
         } else {
             console.log(`[NO CREATOR_JID SET] Admin key for ${senderNumber}: ${newKey}`)
