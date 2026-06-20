@@ -178,6 +178,11 @@ async function handleAdminCommand(ctx) {
         senderNumber, senderJid, senderName, body, senderTier
     } = ctx
 
+    // requesterJid — always built from the plain phone number so the message
+    // goes to the requester's own DM, never contaminated by CREATOR_JID.
+    // This is what ensures /admin responses land in the correct person's DM.
+    const requesterJid = senderNumber ? `${senderNumber}@s.whatsapp.net` : senderJid
+
     const creatorJid    = process.env.CREATOR_JID || ''
     const creatorNumber = creatorJid.split('@')[0].split(':')[0]
 
@@ -231,7 +236,7 @@ async function handleAdminCommand(ctx) {
         // Admin already set → subtle generic reply for non-admins
         if (settings.adminNumber !== '' && !isAdmin) {
             if (checkAdminRateLimit(senderNumber)) return
-            await sendSafeMessage(sock, senderJid, {
+            await sendSafeMessage(sock, requesterJid, {
                 text: `ℹ️ This bot is already configured. Contact the group admin for assistance.`
             })
             return
@@ -246,7 +251,7 @@ async function handleAdminCommand(ctx) {
             const session = pendingKeys[senderJid]
 
             if (!session) {
-                await sendSafeMessage(sock, senderJid, {
+                await sendSafeMessage(sock, requesterJid, {
                     text:
                         `🔒 *Access Denied*\n\n` +
                         `No active configuration session was found for your account.\n\n` +
@@ -258,7 +263,7 @@ async function handleAdminCommand(ctx) {
             if (Date.now() > session.expiresAt) {
                 delete pendingKeys[senderJid]
                 delete approvalQueue[senderNumber]
-                await sendSafeMessage(sock, senderJid, {
+                await sendSafeMessage(sock, requesterJid, {
                     text:
                         `⏰ *Session Expired*\n\n` +
                         `Your configuration window has closed.\n\n` +
@@ -274,7 +279,7 @@ async function handleAdminCommand(ctx) {
                 if (session.attempts >= 3) {
                     delete pendingKeys[senderJid]
                     delete approvalQueue[senderNumber]
-                    await sendSafeMessage(sock, senderJid, {
+                    await sendSafeMessage(sock, requesterJid, {
                         text:
                             `🚫 *Session Voided*\n\n` +
                             `Too many incorrect attempts. Your access session has been cancelled.\n\n` +
@@ -291,7 +296,7 @@ async function handleAdminCommand(ctx) {
                         } catch (_) {}
                     }
                 } else {
-                    await sendSafeMessage(sock, senderJid, {
+                    await sendSafeMessage(sock, requesterJid, {
                         text:
                             `❌ *Invalid Key*\n\n` +
                             `The key you entered is incorrect. (Attempt ${session.attempts}/3)\n\n` +
@@ -314,7 +319,7 @@ async function handleAdminCommand(ctx) {
 
             startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage)
 
-            await sendSafeMessage(sock, senderJid, {
+            await sendSafeMessage(sock, requesterJid, {
                 text:
                     `╔══════════════════════════╗\n` +
                     `   👑  Access Granted\n` +
@@ -355,7 +360,7 @@ async function handleAdminCommand(ctx) {
         }
         approvalQueue[senderNumber] = senderJid
 
-        await sendSafeMessage(sock, senderJid, {
+        await sendSafeMessage(sock, requesterJid, {
             text:
                 `╔══════════════════════════╗\n` +
                 `   🔐  Admin Configuration\n` +
