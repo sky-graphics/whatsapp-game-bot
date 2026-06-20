@@ -6,12 +6,45 @@
 // ============================================================
 
 const matchSummary = require('./matchSummary')
-const { difficultyBadge, nameTag } = require('./permissions')
+const { difficultyBadge, nameTag, resolveSetting } = require('./permissions')
 
 const DEFAULT_WORDS = {
     easy:      ['apple', 'bread', 'cloud', 'dance', 'earth', 'flame', 'grape', 'house', 'ivory', 'juice'],
     normal:    ['browser', 'element', 'network', 'program', 'website', 'database', 'keyboard', 'science', 'offline', 'desktop'],
     difficult: ['algorithm', 'blockchain', 'cryptography', 'deployment', 'encryption', 'framework', 'governance', 'hierarchy', 'interface', 'javascript']
+}
+
+// ─── Automated maxTries ────────────────────────────────────────
+// Per the spec's mandatory addition: a flat manual number is the wrong
+// design for a word game with variable-length words across three
+// difficulty tiers. Attempts scale with word length and tighten as
+// difficulty increases. settings.maxTries can be either:
+//   - the string 'auto' (default) → this formula runs at word-pick time
+//   - a positive integer → manual override, used as-is
+// The result is snapshotted onto gameState.roundMaxTries the moment the
+// word is picked, so a live /set maxtries change never affects a round
+// already in progress — only the NEXT round.
+function calcMaxTries(word, difficulty) {
+    const len = (word || '').length
+    switch (difficulty) {
+        case 'easy':      return Math.max(4, Math.ceil(len * 0.8))
+        case 'normal':    return Math.max(3, Math.ceil(len * 0.6))
+        case 'difficult': return Math.max(3, Math.ceil(len * 0.4))
+        default:          return Math.max(3, Math.ceil(len * 0.6))
+    }
+}
+
+// Resolves the maxTries value that should apply to a freshly-started round.
+// Reads the effective (creator-override-aware) setting; if it's not a
+// resolvable positive integer, falls back to the automated formula.
+function resolveRoundMaxTries(word, difficulty, settings) {
+    const configured = resolveSetting('maxTries', settings, 'auto')
+    if (configured === 'auto' || configured === undefined || configured === null) {
+        return calcMaxTries(word, difficulty)
+    }
+    const n = typeof configured === 'number' ? configured : parseInt(configured, 10)
+    if (Number.isInteger(n) && n > 0) return n
+    return calcMaxTries(word, difficulty)
 }
 
 // ─── getGameState ─────────────────────────────────────────────
@@ -71,8 +104,8 @@ function startLobbyCountdown(chatId, ctx) {
             await startActualGame(chatId, ctx)
 
         } else if (gameState.lobbySecondsLeft % 10 === 0) {
-            // Read difficulty LIVE from settings — not from cached gameState
-            const difficulty = settings.difficulty || 'easy'
+            // Read effective difficulty (creator override aware) LIVE — not cached
+            const difficulty = resolveSetting('difficulty', settings, 'easy')
             const lobbyMentions = gameState.players.map(num => gameState.playerJids[num]).filter(Boolean)
             const lobbyText = gameState.players
                 .map((num, i) => `${i + 1}. ${nameTag(num, gameState.playerNames, settings)}`)
@@ -107,8 +140,8 @@ async function startActualGame(chatId, ctx) {
         })
     }
 
-    // Always read difficulty LIVE from settings at word-pick time
-    const difficulty = settings.difficulty || 'easy'
+    // Always read effective difficulty (creator override aware) LIVE at word-pick time
+    const difficulty = resolveSetting('difficulty', settings, 'easy')
     const pool = (words[difficulty] && words[difficulty].length > 0)
         ? words[difficulty]
         : DEFAULT_WORDS[difficulty]
@@ -121,6 +154,9 @@ async function startActualGame(chatId, ctx) {
     gameState.currentTurnIndex = 0
     gameState.active          = true
     gameState.paused          = false
+    // Snapshot this round's attempt budget NOW so a later /set maxtries
+    // change (manual or auto) never affects a round already in progress.
+    gameState.roundMaxTries   = resolveRoundMaxTries(gameState.targetWord, difficulty, settings)
 
     const lobbyMentions = gameState.players.map(num => gameState.playerJids[num]).filter(Boolean)
     const lobbyText = gameState.players
@@ -131,7 +167,7 @@ async function startActualGame(chatId, ctx) {
         text:
             `🎬 *Lobby Closed — Game On!*\n\n` +
             `🎯 *Mode:* ${difficultyBadge(difficulty)}\n` +
-            `💥 *Attempts per player:* ${settings.maxTries}\n\n` +
+            `💥 *Attempts per player:* ${gameState.roundMaxTries}\n\n` +
             `👥 *Final Player Lineup:*\n${lobbyText}\n\n` +
             `🏆 May the best guesser win!`,
         mentions: lobbyMentions
@@ -147,7 +183,11 @@ async function sendGameBoard(chatId, actionFeedback = '', extraMentions = [], ct
     const gameState = getGameState(chatId, games)
     if (!gameState.active) return
 
-    const difficulty = settings.difficulty || 'easy'
+    const difficulty = resolveSetting('difficulty', settings, 'easy')
+    // Use the round's snapshotted attempt budget — never the live settings
+    // value — so a mid-round /set maxtries change doesn't retroactively
+    // change this round's math (it will apply starting next round).
+    const roundMaxTries = gameState.roundMaxTries || calcMaxTries(gameState.targetWord, difficulty)
 
     const currentPlayerNumber = gameState.players[gameState.currentTurnIndex]
     const currentPlayerJid    = gameState.playerJids[currentPlayerNumber]
@@ -164,7 +204,7 @@ async function sendGameBoard(chatId, actionFeedback = '', extraMentions = [], ct
     }
 
     const playerAttempts  = gameState.attempts[currentPlayerNumber] || 0
-    const attemptsLeft    = settings.maxTries - playerAttempts
+    const attemptsLeft    = roundMaxTries - playerAttempts
 
     let boardText = ''
     if (actionFeedback) boardText += `${actionFeedback}\n\n`
@@ -172,7 +212,7 @@ async function sendGameBoard(chatId, actionFeedback = '', extraMentions = [], ct
     boardText += `🎮 *Word Riddle Game (WRG)*\n`
     boardText += `🎯 Mode: ${difficultyBadge(difficulty)}\n\n`
     boardText += `📝 Word: \`${gameState.hiddenWord.join(' ')}\` *(${gameState.targetWord.length} letters)*\n`
-    boardText += `💥 *${currentPlayerName}'s attempts left: ${attemptsLeft}/${settings.maxTries}*\n\n`
+    boardText += `💥 *${currentPlayerName}'s attempts left: ${attemptsLeft}/${roundMaxTries}*\n\n`
     boardText += `🎯 *Your turn:* ${currentPlayerName}\n`
 
     if (hasMultiplePlayers) {
@@ -283,7 +323,7 @@ function startTurnCountdown(chatId, ctx) {
             await sendGameBoard(chatId, feedback, [], ctx)
 
         } else if (gameState.turnSecondsLeft === 20) {
-            const difficulty = settings.difficulty || 'easy'
+            const difficulty = resolveSetting('difficulty', settings, 'easy')
             await sock.sendMessage(chatId, {
                 text:
                     `⏱️ *${currentPlayerName}, 20 seconds left!* Make your move — ` +
@@ -308,5 +348,7 @@ module.exports = {
     startLobbyCountdown,
     startActualGame,
     sendGameBoard,
-    startTurnCountdown
+    startTurnCountdown,
+    calcMaxTries,
+    resolveRoundMaxTries
 }

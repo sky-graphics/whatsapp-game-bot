@@ -109,6 +109,13 @@ function startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage
     }, 60 * 60 * 1000)
 }
 
+// Formats the maxTries setting for display: 'auto' stays as a readable
+// label, a number shows as-is.
+function formatMaxTries(value) {
+    if (value === 'auto' || value === undefined || value === null) return 'AUTO 🤖'
+    return String(value)
+}
+
 // ─── Help dashboard ───────────────────────────────────────────
 function buildHelpText(settings, forCreator = false) {
     const tier = forCreator
@@ -155,10 +162,10 @@ function buildHelpText(settings, forCreator = false) {
             : '') +
 
         `*📊 Live Config:*\n` +
-        `› Difficulty: *${settings.difficulty.toUpperCase()}*\n` +
-        `› Max Tries: *${settings.maxTries}*\n` +
-        `› Public Visible: *${settings.publicVisible ? '🟢 ON' : '🔴 OFF'}*\n` +
-        `› Public Can Start: *${settings.publicCanStart ? '🟢 ON' : '🔴 OFF'}*\n` +
+        `› Difficulty: *${(resolveSetting('difficulty', settings, 'easy') || 'easy').toUpperCase()}*\n` +
+        `› Max Tries: *${formatMaxTries(resolveSetting('maxTries', settings, 'auto'))}*\n` +
+        `› Public Visible: *${resolveSetting('publicVisible', settings, true) ? '🟢 ON' : '🔴 OFF'}*\n` +
+        `› Public Can Start: *${resolveSetting('publicCanStart', settings, false) ? '🟢 ON' : '🔴 OFF'}*\n` +
         `› Admin Set: *${settings.adminNumber ? '✅ ' + settings.adminNumber : '❌ None'}*\n\n` +
 
         `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
@@ -632,18 +639,30 @@ async function handleAdminCommand(ctx) {
     }
 
     // ─── /set maxtries ───────────────────────────
+    // Accepts either a positive integer (manual override) or 'auto'
+    // (default — scales attempts with word length & difficulty, computed
+    // fresh each round in gameEngine.calcMaxTries / resolveRoundMaxTries).
     if (cmd[0] === 'set' && cmd[1] === 'maxtries') {
-        const n = parseInt(cmd[2], 10)
-        if (Number.isInteger(n) && n > 0) {
-            settings.maxTries = n
+        const arg = (cmd[2] || '').toLowerCase()
+        if (arg === 'auto') {
+            writeSetting(tier, 'maxTries', 'auto', settings)
             saveSettings()
             await sendSafeMessage(sock, replyTo, {
-                text: `⚙️ Max attempts per round: *${settings.maxTries}* 💥`
+                text: `⚙️ Max attempts: *AUTO* 🤖\nAttempts now scale with word length and difficulty each round.`
             })
         } else {
-            await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/set maxtries [positive number]\``
-            })
+            const n = parseInt(arg, 10)
+            if (Number.isInteger(n) && n > 0) {
+                writeSetting(tier, 'maxTries', n, settings)
+                saveSettings()
+                await sendSafeMessage(sock, replyTo, {
+                    text: `⚙️ Max attempts per round: *${n}* 💥 (manual override)`
+                })
+            } else {
+                await sendSafeMessage(sock, replyTo, {
+                    text: `⚠️ Usage: \`/set maxtries [positive number]\` or \`/set maxtries auto\``
+                })
+            }
         }
         return
     }
@@ -652,10 +671,14 @@ async function handleAdminCommand(ctx) {
     if (cmd[0] === 'set' && cmd[1] === 'public') {
         const mode = cmd[2]
         if (mode === 'on' || mode === 'off') {
-            writeSetting(tier, 'publicVisible', (mode === 'on'), settings)
+            const newValue = (mode === 'on')
+            writeSetting(tier, 'publicVisible', newValue, settings)
             saveSettings()
+            // Confirm using newValue directly — reading settings.publicVisible
+            // here would show stale data when the creator just wrote to
+            // creatorOverrides instead of the root settings object.
             await sendSafeMessage(sock, replyTo, {
-                text: settings.publicVisible
+                text: newValue
                     ? `🔓 *Public Visibility: ON*\nNon-admins can interact with the bot. 👥`
                     : `🔒 *Public Visibility: OFF*\nNon-admins are completely silenced. 🤐`
             })
@@ -669,10 +692,13 @@ async function handleAdminCommand(ctx) {
     if (cmd[0] === 'set' && cmd[1] === 'start') {
         const mode = cmd[2]
         if (mode === 'on' || mode === 'off') {
-            writeSetting(tier, 'publicCanStart', (mode === 'on'), settings)
+            const newValue = (mode === 'on')
+            writeSetting(tier, 'publicCanStart', newValue, settings)
             saveSettings()
+            // Same fix as /set public — confirm with newValue, not a
+            // possibly-stale read of the root settings object.
             await sendSafeMessage(sock, replyTo, {
-                text: settings.publicCanStart
+                text: newValue
                     ? `🔓 *Public Game Starts: ON*\nAnyone can type WRG to open a lobby. 🎮`
                     : `🔒 *Public Game Starts: OFF*\nOnly admin can open a lobby. 👑`
             })
@@ -836,10 +862,19 @@ async function handleAdminCommand(ctx) {
     }
 
     // ─── /clearadmin ─────────────────────────────
+    // Clears the admin slot AND the admin's settings layer (difficulty,
+    // publicVisible, publicCanStart, maxTries reset to defaults) since that
+    // layer belongs to whoever is admin. Word pools and creatorOverrides
+    // are untouched — those are shared/creator-owned, not admin-owned.
     if (cmd[0] === 'clearadmin') {
         const cleared = settings.adminNumber
-        settings.adminNumber = ''
-        settings.adminJid    = ''
+        settings.adminNumber    = ''
+        settings.adminJid       = ''
+        settings.difficulty     = 'easy'
+        settings.maxTries       = 'auto'
+        settings.publicVisible  = true
+        settings.publicCanStart = false
+        pendingAdminChangeRef.value = null
         saveSettings()
         if (adminInactivityTimer) {
             clearInterval(adminInactivityTimer)
@@ -848,43 +883,50 @@ async function handleAdminCommand(ctx) {
         await sendSafeMessage(sock, replyTo, {
             text:
                 `✅ *Admin slot cleared.*\n\n` +
-                `${cleared || 'No admin'} has been removed. Word pools and settings are untouched.\n\n` +
+                `${cleared || 'No admin'} has been removed and the admin-layer settings (difficulty, max tries, public access) were reset to defaults.\n\n` +
+                `Word pools and any creator overrides are untouched.\n\n` +
                 `The next */admin* request will begin a fresh onboarding. 🔑`
         })
         return
     }
 
     // ─── /reset ──────────────────────────────────
+    // PER SPEC'S EXPLICIT CORRECTION (overrides the earlier body text in the
+    // same doc): /reset must NOT remove the admin. It only resets settings,
+    // creatorOverrides, and word pools to defaults. The admin keeps their
+    // slot and access. The ONLY command that removes admin status is
+    // /clearadmin — keeping each command single-purpose and focused.
     if (cmd[0] === 'reset') {
+        const keepAdminNumber = settings.adminNumber
+        const keepAdminJid    = settings.adminJid
         Object.assign(settings, {
-            adminNumber: '', adminJid: '',
-            difficulty: 'easy', maxTries: 10,
+            difficulty: 'easy', maxTries: 'auto',
             prefix: 'wrg', adminPrefix: '/',
             publicVisible: true, publicCanStart: false
         })
+        delete settings.creatorOverrides
+        settings.adminNumber = keepAdminNumber
+        settings.adminJid    = keepAdminJid
+        saveSettings()
         pendingAdminChangeRef.value = null
         Object.assign(words, JSON.parse(JSON.stringify(DEFAULT_WORDS)))
         saveWords()
-        if (adminInactivityTimer) {
-            clearInterval(adminInactivityTimer)
-            adminInactivityTimer = null
-        }
-        const SETTINGS_FILE = 'settings.json'
-        const GAMES_FILE    = 'games.json'
-        if (fs.existsSync(SETTINGS_FILE)) fs.unlinkSync(SETTINGS_FILE)
-        if (fs.existsSync(GAMES_FILE))    fs.unlinkSync(GAMES_FILE)
         for (const key in games) {
             const g = games[key]
             if (g.lobbyTimer) clearInterval(g.lobbyTimer)
             if (g.turnTimer)  clearInterval(g.turnTimer)
             delete games[key]
         }
+        const GAMES_FILE = 'games.json'
+        if (fs.existsSync(GAMES_FILE)) fs.unlinkSync(GAMES_FILE)
         activeGameChatRef.value = null
         await sendSafeMessage(sock, replyTo, {
             text:
-                `🔄 *Full Reset Complete* ✅\n\n` +
-                `All settings, games, and word pools restored to defaults.\n\n` +
-                `The bot is now unconfigured. The next */admin* request will begin a fresh onboarding. 🚀`
+                `🔄 *Reset Complete* ✅\n\n` +
+                `Settings, creator overrides, and word pools restored to defaults. Any active game was ended.\n\n` +
+                (keepAdminNumber
+                    ? `👑 Admin (\`${keepAdminNumber}\`) keeps their access — use */clearadmin* if you want to remove them too.`
+                    : `The bot has no admin set — the next */admin* request will begin onboarding.`)
         })
         return
     }
@@ -899,10 +941,10 @@ async function handleAdminCommand(ctx) {
                     `📊 *WRG Bot Status*\n\n` +
                     `🎮 No game or lobby is currently active.\n\n` +
                     `*Config:*\n` +
-                    `› Difficulty: *${settings.difficulty.toUpperCase()}*\n` +
-                    `› Max Tries: *${settings.maxTries}*\n` +
-                    `› Public Visible: *${settings.publicVisible ? '🟢 ON' : '🔴 OFF'}*\n` +
-                    `› Public Can Start: *${settings.publicCanStart ? '🟢 ON' : '🔴 OFF'}*\n` +
+                    `› Difficulty: *${(resolveSetting('difficulty', settings, 'easy') || 'easy').toUpperCase()}*\n` +
+                    `› Max Tries: *${formatMaxTries(resolveSetting('maxTries', settings, 'auto'))}*\n` +
+                    `› Public Visible: *${resolveSetting('publicVisible', settings, true) ? '🟢 ON' : '🔴 OFF'}*\n` +
+                    `› Public Can Start: *${resolveSetting('publicCanStart', settings, false) ? '🟢 ON' : '🔴 OFF'}*\n` +
                     `› Admin: *${settings.adminNumber || 'None'}*`
             })
         } else {
@@ -925,15 +967,16 @@ async function handleAdminCommand(ctx) {
                 statusText += gs.paused ? `⏸️ Status: *PAUSED*\n` : `▶️ Status: *LIVE*\n`
                 statusText += `📝 Word: \`${gs.hiddenWord.join(' ')}\` (${gs.targetWord.length} letters)\n`
                 const attemptsUsed = Object.values(gs.attempts || {}).reduce((a, b) => a + b, 0)
-                statusText += `💥 Wrong guesses so far: *${attemptsUsed}* total (max ${settings.maxTries}/player)\n`
+                const roundMaxTries = gs.roundMaxTries || resolveSetting('maxTries', settings, 'auto')
+                statusText += `💥 Wrong guesses so far: *${attemptsUsed}* total (max ${formatMaxTries(roundMaxTries)}/player)\n`
                 statusText += `🎯 Current turn: *${gs.playerNames[currentPlayer] || currentPlayer}*\n`
                 statusText += `👥 Players: *${gs.players.length}*\n`
                 if (!gs.paused) statusText += `⏱️ Turn timer: *${gs.turnSecondsLeft}s*\n`
             }
 
             statusText += `\n*Config:*\n`
-            statusText += `› Difficulty: *${settings.difficulty.toUpperCase()}*\n`
-            statusText += `› Max Tries: *${settings.maxTries}*`
+            statusText += `› Difficulty: *${(resolveSetting('difficulty', settings, 'easy') || 'easy').toUpperCase()}*\n`
+            statusText += `› Max Tries: *${formatMaxTries(resolveSetting('maxTries', settings, 'auto'))}*`
 
             await sendSafeMessage(sock, replyTo, { text: statusText })
         }
@@ -1004,7 +1047,9 @@ async function handleAdminCommand(ctx) {
             if (gs.turnTimer)  clearInterval(gs.turnTimer)
             gs.players = []
             gs.playerNames = {}
+            gs.playerJids = {}
             gs.skipStreaks = {}
+            gs.attempts = {}
             gs.disqualified = []
             activeGameChatRef.value = null
             persistGames()

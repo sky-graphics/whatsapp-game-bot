@@ -1,6 +1,8 @@
 # WRG Bot — Command & Hierarchy Report
 ## Sky Graphics · Three-Stage Breakdown
 
+*Version 2 — single consistent spec. Supersedes all earlier drafts; no contradictory sections remain.*
+
 ---
 
 # STAGE 1 — THE CREATOR
@@ -48,7 +50,7 @@ Every command is typed anywhere (any group, any DM, even self-chat) and the repl
 
 **Where the reply goes:** Creator's DM only.
 
-**What it shows:** All settings commands, all word pool commands, all game control commands, creator-only commands, and the live values of difficulty, maxTries, publicVisible, publicCanStart, and whether an admin is set.
+**What it shows:** All settings commands, all word pool commands, all game control commands, creator-only commands, and the live *effective* values of difficulty, maxTries, publicVisible, publicCanStart, and whether an admin is set. "Effective" means creator overrides are already applied — the dashboard never shows a value that the game itself would ignore.
 
 **Effect on hierarchy:** None. Purely informational.
 
@@ -61,7 +63,7 @@ Every command is typed anywhere (any group, any DM, even self-chat) and the repl
 1. The requester's DM receives the branded key delivery message with the UUID key and the instruction `/admin YOURKEY`.
 2. The creator's DM receives a confirmation that the key was delivered.
 
-**What happens if the key already expired:** The creator's DM gets a "Too late" notice. The requester's session is cleaned up automatically.
+**What happens if the key already expired:** The creator's DM gets a "Too late" notice immediately when the 10-minute timer runs out. The requester's session is cleaned up automatically.
 
 **What happens if the number has no active request:** Creator's DM gets "No active request found."
 
@@ -102,7 +104,7 @@ Every command is typed anywhere (any group, any DM, even self-chat) and the repl
 3. Creator types `/confirm`
 4. `settings.adminNumber` is set. `settings.adminJid` is cleared (will be re-captured when the new admin next sends a message).
 5. New admin receives a DM: "You've been assigned as WRG Bot administrator."
-6. 30-day inactivity timer starts from this moment.
+6. The 30-day inactivity timer restarts from this moment.
 
 **If creator types `/cancel`:** Pending change is discarded. No state is changed.
 
@@ -115,11 +117,11 @@ Every command is typed anywhere (any group, any DM, even self-chat) and the repl
 
 **Where the reply goes:** Creator's DM.
 
-**OFF behaviour:** Any message from a PUBLIC tier user is silently ignored — except `/admin` which always passes through for onboarding. Non-admins cannot see game updates, cannot join lobbies, cannot play.
+**OFF behaviour:** Any message from a PUBLIC tier user is silently ignored — except `/admin`, which always passes through for onboarding. Non-admins cannot see game updates, cannot join lobbies, cannot play.
 
 **ON behaviour:** All messages from all users are processed normally.
 
-**How it flows down:** Creator's override wins. If creator sets public OFF, admin cannot turn it ON via their own `/set public on` because `resolveSetting()` returns `creatorOverrides.publicVisible` first.
+**How it flows down:** Creator's override wins. If the creator sets public OFF, the admin cannot turn it ON via their own `/set public on`, because `resolveSetting()` returns `creatorOverrides.publicVisible` first.
 
 ---
 
@@ -136,32 +138,79 @@ Every command is typed anywhere (any group, any DM, even self-chat) and the repl
 
 ---
 
-### `/set maxtries [number]`
+### `/set maxtries [number]` or `/set maxtries auto`
 **What it does:** Sets how many wrong letter guesses a player gets before being disqualified for exhausting attempts.
 
 **Where the reply goes:** Creator's DM.
 
-**Effect on game:** Takes effect immediately for the next round's word pick. Mid-game rounds keep the `maxTries` value that was active when that round started (it's read from `settings.maxTries` each time a wrong guess happens, so a live change mid-round does apply immediately).
+**Two modes:**
+- **`auto` (the default):** Attempts scale automatically with the target word's length and the active difficulty. This is the correct design for a game with variable-length words across three difficulty tiers — a flat number is either too easy on long words or too punishing on short ones. The formula:
+
+  ```js
+  function calcMaxTries(word, difficulty) {
+      const len = word.length
+      switch (difficulty) {
+          case 'easy':      return Math.max(4, Math.ceil(len * 0.8))  // generous
+          case 'normal':    return Math.max(3, Math.ceil(len * 0.6))  // balanced
+          case 'difficult': return Math.max(3, Math.ceil(len * 0.4))  // tight
+          default:          return Math.max(3, Math.ceil(len * 0.6))
+      }
+  }
+  ```
+
+  What this gives in practice:
+
+  | Word | Easy | Normal | Difficult |
+  |---|---|---|---|
+  | 5-letter (apple) | 4 | 3 | 3 |
+  | 7-letter (network) | 6 | 5 | 3 |
+  | 10-letter (blockchain) | 8 | 6 | 4 |
+  | 12-letter (cryptography) | 10 | 8 | 5 |
+
+- **A positive integer (manual override):** Locks every round to that exact number regardless of word length, until changed again. `/set maxtries auto` re-enables the formula.
+
+**Effect on game:** The chosen mode is resolved into a concrete number — `gameState.roundMaxTries` — the moment a word is picked at the start of a round, and that snapshot is what the round uses for its entire duration. A `/set maxtries` change made mid-round (auto or manual) never affects the round already in progress; it only applies starting with the *next* round.
 
 **Note:** This does NOT affect skip-based disqualification (3 missed turns), which is hardcoded at 3 and cannot be changed via command.
 
 ---
 
 ### `/clearadmin`
-**What it does:** Removes the admin slot — clears `adminNumber` and `adminJid` — without touching word pools or any other settings.
+**What it does:** Removes the admin entirely — both their identity and the settings layer that belonged to them — so the next person to be onboarded starts from a clean slate.
 
-**Where the reply goes:** Creator's DM.
+**Where the reply goes:** Creator's DM (or the admin's own DM, if the admin runs it on themselves).
 
-**Effect:** Admin slot is empty. The 30-day inactivity timer is stopped. Any future `/admin` requests restart the onboarding flow from zero. The creator's overrides and all word pools are untouched.
+**What it clears:**
+- `adminNumber`, `adminJid`
+- The admin's settings layer: `difficulty`, `maxTries`, `publicVisible`, `publicCanStart` — all reset to their defaults
+- The 30-day inactivity timer — stopped
+- Any pending admin-change confirmation (`pendingAdminChangeRef`)
+
+**What it does NOT touch:**
+- Word pools (shared infrastructure, not admin-owned)
+- `creatorOverrides` (creator-owned — clearing the admin should never silently change what the creator has locked in)
+
+**Effect:** The bot is unconfigured at the admin layer. Any future `/admin` request restarts onboarding from zero.
 
 ---
 
 ### `/reset`
-**What it does:** Full wipe. Resets all settings to defaults, resets all word pools to the default word lists, kills any active game or lobby, deletes `settings.json` and `games.json` from disk.
+**What it does:** Resets configuration back to factory defaults — but, unlike `/clearadmin`, it is **not** about removing the admin. `/reset` and `/clearadmin` are deliberately single-purpose: one resets settings, the other removes admin access. Running `/reset` does not also strip the admin's access, and running `/clearadmin` does not also reset word pools.
 
 **Where the reply goes:** Creator's DM.
 
-**Effect on hierarchy:** Admin slot is cleared. All `creatorOverrides` are cleared. Difficulty reverts to easy. maxTries reverts to 10. publicVisible reverts to true. publicCanStart reverts to false. Any running game is killed immediately. The bot is back to factory state.
+**What it resets:**
+- `difficulty` → `easy`
+- `maxTries` → `auto`
+- `publicVisible` → `true`
+- `publicCanStart` → `false`
+- `creatorOverrides` → cleared entirely
+- All word pools → restored to `DEFAULT_WORDS`
+- Any active game or lobby → killed immediately
+
+**What it deliberately keeps:** `adminNumber` and `adminJid` are left untouched. The admin keeps their access and their inactivity timer keeps running. **The only command that removes admin status is `/clearadmin`.**
+
+**Effect on hierarchy:** The bot returns to default behavior for everyone except the admin slot, which is preserved.
 
 ---
 
@@ -181,7 +230,7 @@ See Stage 3 — these are shared with the admin tier and their game-level effect
 
 ## Creator's Position in the Hierarchy
 
-The creator sits above every other tier permanently. `resolveSetting()` always checks `creatorOverrides` before `settings` (admin-layer). `writeSetting(TIERS.CREATOR, ...)` writes to `creatorOverrides`, not to the root settings object, so the creator's preferences never get overwritten by admin actions. The only thing the admin can do that the creator cannot override at the settings level is nothing — every settings key the admin can touch, the creator can trump.
+The creator sits above every other tier permanently. `resolveSetting()` always checks `creatorOverrides` before `settings` (the admin layer). `writeSetting(TIERS.CREATOR, ...)` writes to `creatorOverrides`, not to the root settings object, so the creator's preferences never get overwritten by admin actions. Every settings key the admin can touch, the creator can trump — there is nothing the admin controls that sits outside the creator's reach.
 
 ---
 ---
@@ -190,7 +239,7 @@ The creator sits above every other tier permanently. `resolveSetting()` always c
 
 ## The Onboarding Flow
 
-The admin slot is empty by default. It must be filled through a key-based approval flow that requires creator involvement. There is no backdoor — no default admin, no first-come-first-served — except in one edge case described below.
+The admin slot is empty by default. It must be filled through a key-based approval flow that requires creator involvement. There is no backdoor — no default admin, no first-come-first-served — except for the one edge case described below.
 
 ---
 
@@ -212,7 +261,7 @@ Anyone who types `/admin` with no argument triggers the onboarding request.
 > Key auto-expires in 10 minutes.
 
 **What is stored internally:**
-- `pendingKeys[senderJid]` = `{ key, expiresAt, senderNumber, senderName }`
+- `pendingKeys[senderJid]` = `{ key, expiresAt, senderNumber, senderName, attempts }`
 - `approvalQueue[senderNumber]` = `senderJid`
 
 ---
@@ -231,6 +280,7 @@ Anyone who types `/admin` with no argument triggers the onboarding request.
 
 **If creator does nothing for 10 minutes:**
 - `cleanExpiredKeys()` runs on every command received and removes the expired session automatically.
+- Creator is notified of the expiry immediately.
 - Requester is not notified of expiry.
 
 ---
@@ -249,7 +299,7 @@ Once they have the key (delivered via `/approve`), they type `/admin [UUID-key]`
 - `settings.adminNumber` = the requester's phone number
 - `settings.adminJid` = the requester's JID
 - `settings.json` is saved to disk
-- 30-day inactivity timer starts
+- The 30-day inactivity timer starts
 - Requester DM: "Access Granted — Welcome, Administrator!"
 - Creator DM: "Admin Registration Complete — Name, Number."
 - Session is deleted from `pendingKeys` and `approvalQueue`
@@ -273,13 +323,13 @@ Once the admin slot is filled, a timer runs every hour in the background. If 30 
 - Creator receives a DM: "Admin Slot Auto-Cleared — [number] has been inactive for 30 days."
 - The bot returns to unconfigured state for the next onboarding request
 
-The 30-day clock resets every time any `/` command is received from either the creator or the admin.
+The 30-day clock resets every time any `/` command is received from either the creator or the admin. This auto-clear is functionally equivalent to the admin's slot being cleared — it does **not** reset the admin's settings layer the way a manual `/clearadmin` does, since the spirit of the inactivity timer is "this person disappeared," not "wipe their configuration choices." If a fresh admin is then onboarded and the creator wants factory-default settings restored too, the creator can run `/reset`, which never touches admin status either way.
 
 ---
 
 ## Admin Commands — Full List
 
-The admin has access to every setting command, every word pool command, and every game control command. The only commands the admin cannot run are the creator-exclusive ones: `/approve`, `/deny`, and anything the creator has overridden via `creatorOverrides`.
+The admin has access to every setting command, every word pool command, and every game control command. The only commands the admin cannot run are the creator-exclusive ones: `/approve`, `/deny`, and `/reset`. The admin's settings changes are also silently superseded by anything the creator has locked in via `creatorOverrides`.
 
 All admin command replies go to the admin's own DM. The group chat never sees a reply to any `/` command.
 
@@ -291,14 +341,14 @@ Returns the help dashboard. Same as `/help` for admin.
 ---
 
 ### `/help`
-Returns the full command dashboard with live config snapshot. Does NOT include the `/approve` and `/deny` section — those are creator-only and not shown to the admin.
+Returns the full command dashboard with a live, effective config snapshot. Does NOT include the `/approve` and `/deny` section — those are creator-only and not shown to the admin.
 
 ---
 
 ### `/set difficulty [easy/normal/difficult]`
 Changes difficulty. Reply: "Difficulty set to: 🟢 *EASY*" (or the chosen level).
 
-**Important:** If the creator has already set a difficulty override via `creatorOverrides`, the admin's change goes to the root settings but the game still uses the creator's override. The admin cannot see that a creator override exists — they get a confirmation reply but the game ignores their setting. This is by design.
+**Important:** If the creator has already set a difficulty override via `creatorOverrides`, the admin's change is still saved to the root settings, but the game uses the creator's override instead. The admin cannot see that a creator override exists — they get a normal confirmation reply, but the game silently ignores their setting. This is by design.
 
 ---
 
@@ -310,37 +360,32 @@ Allows the admin to change the admin slot to a different number. This replaces t
 ---
 
 ### `/set public [on/off]`
-Toggles public visibility. Blocked by creator override if the creator has set it.
+Toggles public visibility. Silently overridden by a creator override if one exists.
 
 ---
 
 ### `/set start [on/off]`
-Toggles whether the public can open lobbies. Blocked by creator override if set.
+Toggles whether the public can open lobbies. Silently overridden by a creator override if one exists.
 
 ---
 
-### `/set maxtries [number]`
-Changes the attempt budget per player per round.
+### `/set maxtries [number]` or `/set maxtries auto`
+Same behavior as the creator's version — see Stage 1. Subject to the same creator-override rule as every other setting.
 
 ---
 
 ### `/clearadmin`
-Clears the admin slot. The admin can clear their own slot. After this, the bot is unconfigured and onboarding starts fresh for the next request.
-
----
-
-### `/reset`
-Full factory reset. Clears everything. Admin loses access immediately after this command executes.
+The admin can clear their own slot. Same effect as described in Stage 1: removes `adminNumber`/`adminJid`, resets the admin's own settings layer (difficulty, maxTries, publicVisible, publicCanStart) to defaults, stops the inactivity timer, and clears any pending admin-change confirmation. Word pools and `creatorOverrides` are untouched. After this, the bot is unconfigured and onboarding starts fresh for the next request.
 
 ---
 
 ### Word Pool Commands: `/addword`, `/removeword`, `/listwords`, `/setwords`, `/clearwords`, `/setallwords`
-Identical behaviour to when the creator uses them. Admin writes to the same shared word pools.
+Identical behavior and guards as described under the creator's commands in Stage 1 — these are shared, not tier-specific.
 
 ---
 
 ### `/status`
-Returns the live game state in the admin's DM. If no game is active, shows the current config. If a lobby is open, shows time remaining and the player list. If a game is in progress, shows the current hidden word, whose turn it is, how many wrong guesses have been made, and whether the game is paused.
+Returns the live game state in the admin's DM. If no game is active, shows the current effective config. If a lobby is open, shows time remaining and the player list. If a game is in progress, shows the current hidden word, whose turn it is, how many wrong guesses have been made against the round's snapshotted attempt budget, and whether the game is paused.
 
 ---
 
@@ -357,7 +402,7 @@ Unfreezes the turn timer. The 30-second countdown restarts from 30 (not from whe
 ---
 
 ### `/end` / `/stop`
-Terminates the active game or lobby immediately. All timers are cleared. All player data is wiped. `activeGameChatRef` is set to null. The group chat receives: "Game terminated by the admin. Thanks for playing, everyone! 👋". Admin DM receives: "Game terminated ✅". No match report is sent.
+Terminates the active game or lobby immediately. All timers are cleared. All player data is wiped — `players`, `playerNames`, `playerJids`, `skipStreaks`, `attempts`, and `disqualified` are all reset. `activeGameChatRef` is set to null. The group chat receives: "Game terminated by the admin. Thanks for playing, everyone! 👋". Admin DM receives: "Game terminated ✅". No match report is sent.
 
 ---
 ---
@@ -391,7 +436,7 @@ Opens a game lobby in the current chat.
 - The creator auto-joins immediately (always, unconditionally)
 - The admin auto-joins immediately if they are a different person from the creator
 - Auto-joined players are displayed with their role badge: "Might Awa (Creator) — Auto-joined 👑"
-- The lobby open message shows the difficulty badge (which reflects the effective difficulty — creator override wins)
+- The lobby open message shows the difficulty badge reflecting the *effective* difficulty — creator override wins
 - `activeGameChatRef.value` is set to this chat — no other chat can start a game until this one ends
 
 ---
@@ -436,9 +481,10 @@ Returns the public-facing how-to-play guide in the current chat. Shows rules, co
 If no one joined except the auto-joined creator and admin, the game proceeds with just them. If the lobby has zero players (which only happens if creator and admin are the same person and they didn't join manually), the game is cancelled: "No one joined the lobby in time."
 
 The game starts:
-- Difficulty is read LIVE from settings at this exact moment — any last-minute `/set difficulty` change applies here
+- The *effective* difficulty is read live from settings at this exact moment, with any creator override applied — any last-minute `/set difficulty` change applies here
 - A word is picked randomly from the appropriate pool
-- If the admin-set pool for that difficulty is empty, the built-in DEFAULT_WORDS list is used as fallback
+- If the admin-set pool for that difficulty is empty, the built-in `DEFAULT_WORDS` list is used as fallback
+- The round's attempt budget (`roundMaxTries`) is calculated and snapshotted right now, using the auto formula or the manual override — see `/set maxtries` in Stage 1
 - `attempts`, `skipStreaks`, `disqualified` are all reset to zero
 - The game board is sent to the group
 
@@ -448,10 +494,10 @@ The game starts:
 
 Sent to the group chat on every turn. Shows:
 - Current hidden word state: `_ _ _ _ _` with revealed letters filled in
-- Current difficulty badge
+- Current difficulty badge (effective, override-aware)
 - Whose turn it is (with role badge if creator or admin)
 - Who is next (with role badge)
-- How many wrong guesses the current player has used vs their budget
+- How many wrong guesses the current player has used vs. this round's snapshotted attempt budget
 - "You have 30 seconds" countdown reminder
 
 ---
@@ -480,9 +526,9 @@ Only the player whose turn it is can guess. If an admin who is not currently pla
 - If the word is fully revealed → victory: match report sent, game ends
 
 **Wrong letter:**
-- Player's `attempts` count increases by 1
-- Feedback shows how many they have used vs their budget
-- If attempts reach `maxTries` → player is disqualified for attempts exhausted
+- Player's `attempts` count (per-player) increases by 1
+- Feedback shows how many they have used vs. the round's snapshotted budget
+- If attempts reach the round's `roundMaxTries` → player is disqualified for attempts exhausted
 - Turn advances (even on disqualification)
 
 ---
@@ -506,7 +552,7 @@ After 3 consecutive missed turns (timeouts), the player is removed:
 - Group chat notified
 
 **Path 2 — Attempts exhausted:**
-After using all `maxTries` wrong guesses:
+After using all of the round's snapshotted `roundMaxTries` wrong guesses:
 - Same removal process
 - Added to `disqualified` with reason "Used all wrong guesses"
 
@@ -538,7 +584,8 @@ All names in the match report use `nameTag(number, nameCache, settings)` — mea
 |---|---|
 | `/set difficulty easy` (creator) | Next game picks easy words regardless of admin's difficulty setting |
 | `/set difficulty normal` (admin) | Next game picks normal words — unless creator has set an override |
-| `/set maxtries 5` | Players now only get 5 wrong guesses before disqualification |
+| `/set maxtries auto` (default) | Each round's attempt budget scales with that word's length and difficulty |
+| `/set maxtries 5` | Every round locks to exactly 5 wrong guesses regardless of word length, until set back to `auto` |
 | `/set public off` | Public users become completely invisible to the bot — game commands ignored, no replies |
 | `/set public on` | Public users can interact normally |
 | `/set start off` (default) | Public cannot type WRG to open a lobby. Only admin/creator can |
@@ -547,15 +594,26 @@ All names in the match report use `nameTag(number, nameCache, settings)` — mea
 | `/resume` | Turn timer restarts at 30 seconds for the current player |
 | `/end` or `/stop` | Game ends immediately. No winner, no report. All player data wiped |
 | `/addword difficult algorithm` | Next difficult game has one more word in the pool to pick from |
-| `/clearwords easy` (if other pools have words) | Easy games now use DEFAULT_WORDS fallback instead of custom pool |
-| `/reset` | Everything resets. Any active game dies mid-round. Public returns to default (visible, cannot start) |
+| `/clearwords easy` (if other pools have words) | Easy games now use `DEFAULT_WORDS` fallback instead of custom pool |
+| `/clearadmin` | Admin loses access; admin's settings layer resets to defaults; word pools and creator overrides are untouched |
+| `/reset` | Settings, creator overrides, and word pools reset to defaults; any active game dies mid-round; **the admin keeps their access** |
 
 ---
 
 ## Summary of the Hierarchy in Plain Terms
 
-**Creator** is the permanent owner. Set in the environment, unrevokable, always detected. Can override any admin setting. Auto-joins every game. Gets every notification the admin gets, plus the key approval flow. Cannot be locked out.
+**Creator** is the permanent owner. Set in the environment, unrevokable, always detected. Can override any admin setting. Auto-joins every game. Gets every notification the admin gets, plus the key approval flow. Cannot be locked out. Only the creator can run `/approve`, `/deny`, and `/reset`.
 
-**Admin** is the tenant operator. Set through the key onboarding flow, lasts 30 days of activity. Has full game and settings control within the bounds the creator has left open. If the creator overrides a setting, the admin's version of that setting is silently ignored. The admin can clear themselves and can be auto-cleared by inactivity.
+**Admin** is the tenant operator. Set through the key onboarding flow (or directly by the creator via `/set admin`), and remains active as long as someone uses an admin or creator command at least once every 30 days. Has full game and settings control within the bounds the creator has left open. If the creator overrides a setting, the admin's version of that setting is silently ignored — the admin still gets a normal confirmation reply, but the game uses the creator's value. The admin can remove their own access with `/clearadmin`, or be auto-removed by 30 days of inactivity. **`/clearadmin` is the only path — manual or automatic — that ends an admin's access; `/reset` never does.**
 
-**Participants** are the audience. Their entire experience is gated by two switches the admin and creator control. Within those gates, they play the game — join lobbies, guess letters, compete to be last standing. They have no visibility into admin commands and receive no replies to slash commands.
+**Participants** are the audience. Their entire experience is gated by two switches the admin and creator control (`publicVisible`, `publicCanStart`). Within those gates, they play the game — join lobbies, guess letters, compete to be last standing. They have no visibility into admin commands and receive no replies to slash commands.
+
+---
+
+## Design Notes — Why These Choices Were Made
+
+**Automated `maxTries` instead of a flat number:** A single fixed attempt budget doesn't scale across word lengths or difficulty tiers — a 12-letter word and a 5-letter word shouldn't carry the same wrong-guess allowance. The formula scales attempts with word length and tightens as difficulty increases, while still allowing a manual override (`/set maxtries [number]`) for anyone who wants fixed, predictable behavior. The chosen value is snapshotted per round (`roundMaxTries`) so a live setting change never retroactively changes math for a round already underway.
+
+**`/clearadmin` resets the admin's settings layer, not just their identity:** Difficulty, maxTries, and the two public-access flags are part of what makes an admin's configuration "theirs." Leaving stale values behind after removing the person who set them would hand the next admin an inherited configuration they never chose. Word pools and creator overrides are excluded deliberately — those are shared/creator-owned, not admin-owned, so clearing an admin should never silently change either.
+
+**`/reset` never removes the admin:** Each command should do exactly one job. `/reset` is for "put the configuration back to defaults," not "remove this person's access" — those are different operations with different blast radii, and conflating them means there's no way to reset settings without also kicking out a perfectly fine admin. `/clearadmin` is the single, focused command for removing admin access, manually or via the inactivity timer.

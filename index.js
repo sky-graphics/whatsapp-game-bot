@@ -22,7 +22,7 @@ const {
 } = require('./gameEngine')
 
 const {
-    getTier, nameTag, difficultyBadge, TIERS
+    getTier, nameTag, difficultyBadge, TIERS, resolveSetting
 } = require('./permissions')
 
 const { handleAdminCommand } = require('./adminCommands')
@@ -47,7 +47,7 @@ let settings = {
     adminNumber:    '',
     adminJid:       '',
     difficulty:     'easy',
-    maxTries:       10,
+    maxTries:       'auto',
     prefix:         'wrg',
     adminPrefix:    '/',
     publicVisible:  true,
@@ -433,7 +433,10 @@ async function startBot() {
 
             // Non-admins invisible unless publicVisible is on —
             // EXCEPT slash-commands (always reach adminCommands for onboarding)
-            if (!isAdmin && !settings.publicVisible && !body.startsWith(settings.adminPrefix)) continue
+            // FIX: read via resolveSetting() so a creator override on
+            // publicVisible always wins over the admin's raw setting.
+            const effectivePublicVisible = resolveSetting('publicVisible', settings, true)
+            if (!isAdmin && !effectivePublicVisible && !body.startsWith(settings.adminPrefix)) continue
 
             // Refresh admin JID on every inbound admin message
             if (senderNumber === settings.adminNumber) {
@@ -460,6 +463,11 @@ async function startBot() {
                     DEFAULT_WORDS,
                     fs,
                     senderNumber,
+                    // senderDisplayId: best available identifier for display/approval-queue
+                    // purposes when senderNumber resolution failed (LID-only requester).
+                    // Falls back to the raw sender JID's local part so /approve still
+                    // has something usable to match against.
+                    senderDisplayId: senderNumber || sender.split('@')[0].split(':')[0] || '',
                     senderName,
                     senderJid,
                     sender: from,
@@ -506,7 +514,10 @@ async function startBot() {
             }
 
             if (isAllCapsWRG) {
-                if (!isAdmin && !settings.publicCanStart) {
+                // FIX: read via resolveSetting() — creator's override on
+                // publicCanStart must win over whatever the admin set.
+                const effectivePublicCanStart = resolveSetting('publicCanStart', settings, false)
+                if (!isAdmin && !effectivePublicCanStart) {
                     await sock.sendMessage(from, {
                         text: `🔒 *Game Locked*\nThe admin hasn't enabled public game starts. Only the admin can open a lobby right now.`
                     })
@@ -568,7 +579,10 @@ async function startBot() {
                     ? gameState.players.map((num, i) => `${i + 1}. ${nameTag(num, nameCache, settings)} — Auto-joined 👑`).join('\n')
                     : '[No players yet — be first! 🎯]'
 
-                const difficulty = settings.difficulty || 'easy'
+                // FIX: read effective difficulty via resolveSetting() so the
+                // lobby badge reflects a creator override, not just the raw
+                // admin-layer setting.
+                const difficulty = resolveSetting('difficulty', settings, 'easy')
                 await sock.sendMessage(from, {
                     text:
                         `🎮 *Word Riddle Game is Starting!*\n\n` +
@@ -708,14 +722,18 @@ async function startBot() {
                             }
                         } else {
                             gameState.attempts[currentPlayerNumber] = (gameState.attempts[currentPlayerNumber] || 0) + 1
+                            // Use this round's snapshotted attempt budget, not the
+                            // live settings value — a /set maxtries change mid-round
+                            // must not retroactively change an in-progress round's math.
+                            const roundMaxTries = gameState.roundMaxTries || settings.maxTries
 
                             // FIX BUG-04: use nameTag not tag()
                             const feedback =
                                 `❌ *Wrong guess!*\n` +
                                 `${nameTag(senderNumber, nameCache, settings)} guessed *${body.toUpperCase()}* — not in the word. 🔴\n` +
-                                `_(${gameState.attempts[currentPlayerNumber]}/${settings.maxTries} wrong guesses for this player)_`
+                                `_(${gameState.attempts[currentPlayerNumber]}/${roundMaxTries} wrong guesses for this player)_`
 
-                            if (gameState.attempts[currentPlayerNumber] >= settings.maxTries) {
+                            if (gameState.attempts[currentPlayerNumber] >= roundMaxTries) {
                                 // FIX BUG-21: recordDisqualification now cleans up playerJids + attempts internally
                                 matchSummary.recordDisqualification(gameState, currentPlayerNumber, matchSummary.DQ_REASONS.ATTEMPTS_EXHAUSTED)
 
@@ -724,7 +742,7 @@ async function startBot() {
                                 const dqFeedback =
                                     `${feedback}\n\n` +
                                     `🚫 *Disqualified!*\n` +
-                                    `${nameTag(currentPlayerNumber, nameCache, settings)} has used all *${settings.maxTries}* wrong guesses and has been eliminated. 💀`
+                                    `${nameTag(currentPlayerNumber, nameCache, settings)} has used all *${roundMaxTries}* wrong guesses and has been eliminated. 💀`
 
                                 const lastStanding = matchSummary.checkLastPlayerStanding(gameState)
                                 if (lastStanding) {
