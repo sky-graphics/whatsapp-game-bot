@@ -17,10 +17,16 @@ const crypto = require('crypto')
 
 // FIX BUG-10: single clean import — no duplicate require
 const {
-    TIERS, getTier, isCreator: isCreatorFn,
-    canRunCommand, difficultyBadge, writeSetting,
-    resolveSetting, getReplyTarget, nameTag
+    TIERS,
+    difficultyBadge, writeSetting,
+    resolveSetting, nameTag
 } = require('./permissions')
+
+// startActualGame is needed by the /wrg start (force-start) handler further
+// below. It was missing from this file's imports entirely — calling it
+// crashed with "ReferenceError: startActualGame is not defined" the first
+// time anyone ran /wrg start against an open lobby.
+const { startActualGame } = require('./gameEngine')
 
 // ─── Pending key sessions ────────────────────────────────────
 // Map: senderJid → { key, expiresAt, senderNumber, senderName, attempts }
@@ -184,8 +190,9 @@ async function handleAdminCommand(ctx) {
         sock, settings, words, games, activeGameChatRef,
         pendingAdminChangeRef, saveSettings, saveWords, persistGames,
         sendSafeMessage, getGameState, startTurnCountdown,
-        DEFAULT_WORDS, fs,
-        senderNumber, senderDisplayId, senderJid, senderName, body, senderTier
+        DEFAULT_WORDS, fs, nameCache,
+        senderNumber, senderDisplayId, senderJid, senderName, body, senderTier,
+        sender
     } = ctx
 
     // requesterJid — always built from the plain phone number so the message
@@ -769,7 +776,7 @@ _Set by the admin._ 🛡️`
             await sendSafeMessage(sock, replyTo, {
                 text: newValue
                     ? `🟢 *Auto-Join: ON*\nYou (${roleLabel}) will automatically join every lobby when it opens. 🎮`
-                    : `🔴 *Auto-Join: OFF*\nYou (${roleLabel}) must type *wrg join* to enter lobbies manually. 👋`
+                    : `🔴 *Auto-Join: OFF*\nYou (${roleLabel}) must type *!wrg join* to enter lobbies manually. 👋`
             })
         } else {
             await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/wrg set autojoin [on/off]\`` })
@@ -971,7 +978,11 @@ _Set by the admin._ 🛡️`
         const keepAdminJid    = settings.adminJid
         Object.assign(settings, {
             difficulty: 'easy', maxTries: 'auto',
-            prefix: 'wrg', adminPrefix: '/',
+            // NOTE: prefix/adminPrefix are intentionally NOT reset here.
+            // The live values ('!wrg' / '/wrg ') are the current command
+            // namespace the whole bot depends on — reverting to the old
+            // pre-rewrite values ('wrg' / '/') would silently break every
+            // command, including /wrg reset itself, on the very next message.
             publicVisible: true, publicCanStart: false
         })
         delete settings.creatorOverrides
