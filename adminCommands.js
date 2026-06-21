@@ -100,7 +100,7 @@ function startAdminInactivityTimer(settings, saveSettings, sock, sendSafeMessage
                         text:
                             `⚠️ *Admin Slot Auto-Cleared*\n\n` +
                             `${cleared} has been inactive for *30 days* — the admin slot has been reset.\n\n` +
-                            `The bot is now unconfigured. The next */admin* request will begin fresh onboarding. 🚀`
+                            `The bot is now unconfigured. The next */wrg admin* request will begin fresh onboarding. 🚀`
                     })
                 } catch (_) {}
             }
@@ -133,33 +133,34 @@ function buildHelpText(settings, forCreator = false) {
         `Reply with *1*, *2*, or *3* for a category — or just use any command directly:\n\n` +
 
         `*1️⃣ Settings*\n` +
-        `› \`/set difficulty [easy/normal/difficult]\`\n` +
-        `› \`/set admin [number]\` → \`/confirm\` · \`/cancel\`\n` +
-        `› \`/set public [on/off]\` — non-admin visibility\n` +
-        `› \`/set start [on/off]\` — public lobby start\n` +
-        `› \`/set autojoin [on/off]\` — auto-join lobbies when they open\n` +
-        `› \`/set maxtries [n]\` — attempt budget\n` +
-        `› \`/clearadmin\` — clear admin slot only (keeps pools)\n` +
-        `› \`/reset\` — ⚠️ wipe ALL data\n\n` +
+        `› \`/wrg set difficulty [easy/normal/difficult]\`\n` +
+        `› \`/wrg set admin [number]\` → \`/wrg confirm\` · \`/wrg cancel\`\n` +
+        `› \`/wrg set public [on/off]\` — non-admin visibility\n` +
+        `› \`/wrg set start [on/off]\` — public lobby start\n` +
+        `› \`/wrg set autojoin [on/off]\` — auto-join lobbies when they open\n` +
+        `› \`/wrg set maxtries [n]\` — attempt budget\n` +
+        `› \`/wrg clearadmin\` — clear admin slot only (keeps pools)\n` +
+        `› \`/wrg reset\` — ⚠️ wipe ALL data\n\n` +
 
         `*2️⃣ Word Pools*\n` +
-        `› \`/addword [level] [word]\`\n` +
-        `› \`/removeword [level] [word]\`\n` +
-        `› \`/listwords [level]\`\n` +
-        `› \`/setwords [level] w1 w2 ...\` — replace pool\n` +
-        `› \`/clearwords [level]\` — cannot empty last pool\n` +
-        `› \`/setallwords easy:w1,w2 normal:w3 difficult:w4\`\n\n` +
+        `› \`/wrg addword [level] [word]\`\n` +
+        `› \`/wrg removeword [level] [word]\`\n` +
+        `› \`/wrg listwords [level]\`\n` +
+        `› \`/wrg setwords [level] w1 w2 ...\` — replace pool\n` +
+        `› \`/wrg clearwords [level]\` — cannot empty last pool\n` +
+        `› \`/wrg setallwords easy:w1,w2 normal:w3 difficult:w4\`\n\n` +
 
         `*3️⃣ Game Controls*\n` +
-        `› \`/status\` — live game state in your DM\n` +
-        `› \`/pause\` — freeze turn timer\n` +
-        `› \`/resume\` — unfreeze\n` +
-        `› \`/end\` · \`/stop\` — kill active game\n\n` +
+        `› \`/wrg status\` — live game state in your DM\n` +
+        `› \`/wrg start\` — force lobby to start immediately\n` +
+        `› \`/wrg pause\` — freeze turn timer\n` +
+        `› \`/wrg resume\` — unfreeze\n` +
+        `› \`/wrg end\` · \`/wrg stop\` — kill active game\n\n` +
 
         (forCreator
             ? `*🔐 Creator-Only:*\n` +
-              `› \`/approve [number]\` — send access key to requester\n` +
-              `› \`/deny [number]\` — void their key immediately\n\n`
+              `› \`/wrg approve [number]\` — send access key to requester\n` +
+              `› \`/wrg deny [number]\` — void their key immediately\n\n`
             : '') +
 
         `*📊 Live Config:*\n` +
@@ -208,8 +209,12 @@ async function handleAdminCommand(ctx) {
     // FIX BUG-11: tier is now always defined
     const tier = senderTier || TIERS.PUBLIC
 
-    const raw = body.slice(1).trim()
-    const cmd = raw.split(' ')
+    // Strip "/" and shift past "wrg" so cmd[0] = command, cmd[1]+ = args
+    // e.g. "/wrg help" -> raw="wrg help" -> parts=["wrg","help"] -> cmd=["help"]
+    // e.g. "/wrg set difficulty easy" -> cmd=["set","difficulty","easy"]
+    const raw   = body.slice(1).trim()
+    const parts = raw.split(' ')
+    const cmd   = parts.slice(1)  // cmd[0]=command, cmd[1]+=arguments
 
     // Bump inactivity clock on every admin/creator command
     if (senderIsCreator || isAdmin) {
@@ -234,7 +239,7 @@ async function handleAdminCommand(ctx) {
                     `Welcome back, *Founder*. 👋\n\n` +
                     `You have *unrestricted access* to every function of this bot — ` +
                     `no keys, no approvals, no gates.\n\n` +
-                    `Type */help* to open the full dashboard.\n\n` +
+                    `Type */wrg help* to open the full dashboard.\n\n` +
                     `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
                     `_WRG Bot · Sky Graphics_ 🎨`
             })
@@ -314,7 +319,7 @@ async function handleAdminCommand(ctx) {
                         text:
                             `❌ *Invalid Key*\n\n` +
                             `The key you entered is incorrect. (Attempt ${session.attempts}/3)\n\n` +
-                            `Double-check the key and try again: \`/admin YOURKEY\` 🔑`
+                            `Double-check the key and try again: \`/wrg admin YOURKEY\` 🔑`
                     })
                 }
                 return
@@ -409,7 +414,7 @@ async function handleAdminCommand(ctx) {
                 `Hello! 👋\n\n` +
                 `You're attempting to access the *Bot Administration Panel*.\n\n` +
                 `To proceed, enter the access key provided to you by the *Sky Graphics team*:\n\n` +
-                `\`/admin YOURKEY\`\n\n` +
+                `\`/wrg admin YOURKEY\`\n\n` +
                 `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
                 `📩 Don't have a key? Contact Sky Graphics to request access.`
         })
@@ -428,9 +433,9 @@ async function handleAdminCommand(ctx) {
                         `🗝️ *Key:* \`${newKey}\`\n\n` +
                         `*What do you want to do?*\n\n` +
                         `✅ To *approve* and send them the key:\n` +
-                        `\`/approve ${displayId}\`\n\n` +
+                        `\`/wrg approve ${displayId}\`\n\n` +
                         `❌ To *deny* and void the key immediately:\n` +
-                        `\`/deny ${displayId}\`\n\n` +
+                        `\`/wrg deny ${displayId}\`\n\n` +
                         `_If you do nothing, the key auto-expires in 10 minutes._\n\n` +
                         `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
                         `_WRG Bot · Sky Graphics_ 🎨`
@@ -455,7 +460,7 @@ async function handleAdminCommand(ctx) {
         if (!targetNumber) {
             // FIX BUG-15: reply to creatorJid not creatorNumber
             await sendSafeMessage(sock, creatorJid, {
-                text: `⚠️ Usage: \`/approve [number]\``
+                text: `⚠️ Usage: \`/wrg approve [number]\``
             })
             return
         }
@@ -492,7 +497,7 @@ async function handleAdminCommand(ctx) {
                     `Here is your access key:\n\n` +
                     `*\`${session.key}\`*\n\n` +
                     `To activate your admin account, type:\n` +
-                    `\`/admin ${session.key}\`\n\n` +
+                    `\`/wrg admin ${session.key}\`\n\n` +
                     `⏰ *This key expires in 10 minutes.*\n` +
                     `Do not share it with anyone.\n\n` +
                     `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
@@ -521,7 +526,7 @@ async function handleAdminCommand(ctx) {
         const targetNumber = (cmd[1] || '').replace(/[^0-9]/g, '')
         if (!targetNumber) {
             await sendSafeMessage(sock, creatorJid, {
-                text: `⚠️ Usage: \`/deny [number]\``
+                text: `⚠️ Usage: \`/wrg deny [number]\``
             })
             return
         }
@@ -587,9 +592,23 @@ async function handleAdminCommand(ctx) {
         if (['easy', 'normal', 'difficult'].includes(newDiff)) {
             writeSetting(tier, 'difficulty', newDiff, settings)
             saveSettings()
+            // DM confirmation to the admin/creator
             await sendSafeMessage(sock, replyTo, {
                 text: `⚙️ Difficulty set to: ${difficultyBadge(newDiff)} 🎯`
             })
+            // Also announce in the group where the command was typed
+            // so players know the mode has changed
+            if (sender && sender !== replyTo && (sender.includes('@g.us') || sender.includes('@s.whatsapp.net'))) {
+                try {
+                    await sock.sendMessage(sender, {
+                        text: `📢 *Game mode updated!*
+
+🎯 Difficulty is now: ${difficultyBadge(newDiff)}
+
+_Set by the admin._ 🛡️`
+                    })
+                } catch (_) {}
+            }
         } else {
             await sendSafeMessage(sock, replyTo, {
                 text: `⚠️ Invalid option. Choose: \`easy\` · \`normal\` · \`difficult\``
@@ -607,11 +626,11 @@ async function handleAdminCommand(ctx) {
                 text:
                     `⚠️ *Confirm Admin Change?*\n\n` +
                     `New number: *${newAdmin}*\n\n` +
-                    `Type */confirm* to apply, or */cancel* to discard.`
+                    `Type */wrg confirm* to apply, or */wrg cancel* to discard.`
             })
         } else {
             await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/set admin [full number with country code]\``
+                text: `⚠️ Usage: \`/wrg set admin [full number with country code]\``
             })
         }
         return
@@ -637,7 +656,7 @@ async function handleAdminCommand(ctx) {
                         `   👑  You're the Admin\n` +
                         `╚══════════════════════════╝\n\n` +
                         `Welcome! 🎉 You have been assigned as the *WRG Bot* administrator.\n\n` +
-                        `Type */help* to see all your commands.\n\n` +
+                        `Type */wrg help* to see all your commands.\n\n` +
                         `━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
                         `_WRG Bot · Sky Graphics_ 🎨`
                 })
@@ -646,7 +665,7 @@ async function handleAdminCommand(ctx) {
             }
         } else {
             await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Nothing to confirm. Use \`/set admin [number]\` first.`
+                text: `⚠️ Nothing to confirm. Use \`/wrg set admin [number]\` first.`
             })
         }
         return
@@ -687,7 +706,7 @@ async function handleAdminCommand(ctx) {
                 })
             } else {
                 await sendSafeMessage(sock, replyTo, {
-                    text: `⚠️ Usage: \`/set maxtries [positive number]\` or \`/set maxtries auto\``
+                    text: `⚠️ Usage: \`/wrg set maxtries [positive number]\` or \`/wrg set maxtries auto\``
                 })
             }
         }
@@ -710,7 +729,7 @@ async function handleAdminCommand(ctx) {
                     : `🔒 *Public Visibility: OFF*\nNon-admins are completely silenced. 🤐`
             })
         } else {
-            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/set public [on/off]\`` })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/wrg set public [on/off]\`` })
         }
         return
     }
@@ -730,7 +749,7 @@ async function handleAdminCommand(ctx) {
                     : `🔒 *Public Game Starts: OFF*\nOnly admin can open a lobby. 👑`
             })
         } else {
-            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/set start [on/off]\`` })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/wrg set start [on/off]\`` })
         }
         return
     }
@@ -753,7 +772,7 @@ async function handleAdminCommand(ctx) {
                     : `🔴 *Auto-Join: OFF*\nYou (${roleLabel}) must type *wrg join* to enter lobbies manually. 👋`
             })
         } else {
-            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/set autojoin [on/off]\`` })
+            await sendSafeMessage(sock, replyTo, { text: `⚠️ Usage: \`/wrg set autojoin [on/off]\`` })
         }
         return
     }
@@ -780,7 +799,7 @@ async function handleAdminCommand(ctx) {
             }
         } else {
             await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/addword [easy/normal/difficult] [word]\``
+                text: `⚠️ Usage: \`/wrg addword [easy/normal/difficult] [word]\``
             })
         }
         return
@@ -804,7 +823,7 @@ async function handleAdminCommand(ctx) {
             }
         } else {
             await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/removeword [easy/normal/difficult] [word]\``
+                text: `⚠️ Usage: \`/wrg removeword [easy/normal/difficult] [word]\``
             })
         }
         return
@@ -819,7 +838,7 @@ async function handleAdminCommand(ctx) {
             })
         } else {
             await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/listwords [easy/normal/difficult]\``
+                text: `⚠️ Usage: \`/wrg listwords [easy/normal/difficult]\``
             })
         }
         return
@@ -842,7 +861,7 @@ async function handleAdminCommand(ctx) {
             }
         } else {
             await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/setwords [easy/normal/difficult] word1 word2 ...\``
+                text: `⚠️ Usage: \`/wrg setwords [easy/normal/difficult] word1 word2 ...\``
             })
         }
         return
@@ -869,7 +888,7 @@ async function handleAdminCommand(ctx) {
             })
         } else {
             await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/clearwords [easy/normal/difficult]\``
+                text: `⚠️ Usage: \`/wrg clearwords [easy/normal/difficult]\``
             })
         }
         return
@@ -905,7 +924,7 @@ async function handleAdminCommand(ctx) {
             })
         } else if (valid) {
             await sendSafeMessage(sock, replyTo, {
-                text: `⚠️ Usage: \`/setallwords easy:w1,w2 normal:w3 difficult:w4\``
+                text: `⚠️ Usage: \`/wrg setallwords easy:w1,w2 normal:w3 difficult:w4\``
             })
         }
         return
@@ -936,7 +955,7 @@ async function handleAdminCommand(ctx) {
                 `✅ *Admin slot cleared.*\n\n` +
                 `${cleared || 'No admin'} has been removed and the admin-layer settings (difficulty, max tries, public access) were reset to defaults.\n\n` +
                 `Word pools and any creator overrides are untouched.\n\n` +
-                `The next */admin* request will begin a fresh onboarding. 🔑`
+                `The next */wrg admin* request will begin a fresh onboarding. 🔑`
         })
         return
     }
@@ -976,8 +995,8 @@ async function handleAdminCommand(ctx) {
                 `🔄 *Reset Complete* ✅\n\n` +
                 `Settings, creator overrides, and word pools restored to defaults. Any active game was ended.\n\n` +
                 (keepAdminNumber
-                    ? `👑 Admin (\`${keepAdminNumber}\`) keeps their access — use */clearadmin* if you want to remove them too.`
-                    : `The bot has no admin set — the next */admin* request will begin onboarding.`)
+                    ? `👑 Admin (\`${keepAdminNumber}\`) keeps their access — use */wrg clearadmin* if you want to remove them too.`
+                    : `The bot has no admin set — the next */wrg admin* request will begin onboarding.`)
         })
         return
     }
@@ -1037,6 +1056,46 @@ async function handleAdminCommand(ctx) {
 
     // ─── Game control commands ────────────────────
     const activeGameChat = activeGameChatRef.value
+
+    // /wrg start — force lobby to close and game to begin immediately.
+    // Admin types this IN THE GROUP where the lobby is open.
+    // Bot announces in the group AND sends confirmation to admin DM.
+    if (cmd[0] === 'start') {
+        if (!activeGameChat) {
+            await sendSafeMessage(sock, replyTo, {
+                text: `⚠️ No active lobby to force-start. Open one with *!wrg start* in the group first.`
+            })
+        } else {
+            const gs = getGameState(activeGameChat, games)
+            if (gs.lobbyActive) {
+                if (gs.lobbyTimer) clearInterval(gs.lobbyTimer)
+                // Announce in the group where the game is happening
+                await sock.sendMessage(activeGameChat, {
+                    text:
+                        `⚡ *Game starting early!*
+
+` +
+                        `The admin has force-started the game. Lobby is now closed — let's go! 🎮`
+                })
+                // Confirm to admin DM
+                await sendSafeMessage(sock, replyTo, {
+                    text: `▶️ *Force-start sent.* Game is launching now in the group. ⚡`
+                })
+                await startActualGame(activeGameChat, {
+                    sock, games, settings, words, activeGameChatRef, persistGames, nameCache
+                })
+            } else if (gs.active) {
+                await sendSafeMessage(sock, replyTo, {
+                    text: `⚠️ The game is already in progress — use */wrg end* to stop it first.`
+                })
+            } else {
+                await sendSafeMessage(sock, replyTo, {
+                    text: `⚠️ No active lobby found. Open one with *!wrg start* in the group.`
+                })
+            }
+        }
+        return
+    }
 
     if (cmd[0] === 'pause') {
         if (!activeGameChat) {

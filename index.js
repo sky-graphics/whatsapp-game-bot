@@ -48,8 +48,8 @@ let settings = {
     adminJid:       '',
     difficulty:     'easy',
     maxTries:       'auto',
-    prefix:         'wrg',
-    adminPrefix:    '/',
+    prefix:         '!wrg',
+    adminPrefix:    '/wrg ',
     publicVisible:  true,
     publicCanStart: false
 }
@@ -312,7 +312,7 @@ async function startBot() {
                 const ctx = buildCtx(sock)
                 if (gs.lobbyActive) {
                     await sock.sendMessage(activeGameChatRef.value, {
-                        text: `🔁 *Bot restarted.* Resuming the lobby countdown (${gs.lobbySecondsLeft}s left). Type *wrg join* if you haven't! ⏱️`
+                        text: `🔁 *Bot restarted.* Resuming the lobby countdown (${gs.lobbySecondsLeft}s left). Type *!wrg join* if you haven't! ⏱️`
                     })
                     startLobbyCountdown(activeGameChatRef.value, ctx)
                 } else if (gs.active && !gs.paused) {
@@ -480,18 +480,18 @@ async function startBot() {
                 continue
             }
 
-            // ── WRG (all caps) = start lobby ────────────────
-            const isAllCapsWRG = rawBody === 'WRG'
-            const isMixedWRG   = !isAllCapsWRG && rawBody.toUpperCase() === 'WRG'
+            // ── !wrg start = open lobby ─────────────────────
+            // !wrg start opens the lobby (replaces old WRG all-caps)
+            // !wrg (alone, any case) shows ping + participant dashboard
+            const isAllCapsWRG = rawBody === '!wrg start' || rawBody === '!WRG START'
+            const isMixedWRG   = body === '!wrg' && rawBody.toLowerCase() === '!wrg'
 
             if (isMixedWRG) {
                 const pingStart = Date.now()
-                await sock.sendMessage(from, { text: 'Ping! 🏓' })
-                await sock.sendMessage(from, { text: 'Pong! 🏓' })
-                await sock.sendMessage(from, { text: 'Ping! 🏓' })
-                await sock.sendMessage(from, { text: 'Pong! 🏓' })
+                await sock.sendMessage(from, { text: '🏓 Ping!' })
+                await sock.sendMessage(from, { text: '🏓 Pong!' })
                 const pingMs = Date.now() - pingStart
-                await sock.sendMessage(from, { text: `🤖 *WRG Bot* | Response time: *${pingMs}ms*` })
+                await sock.sendMessage(from, { text: `⚡ *WRG Bot* | Response time: *${pingMs}ms*` })
 
                 await sock.sendMessage(from, {
                     text:
@@ -503,8 +503,8 @@ async function startBot() {
                         `_Created with ❤️ by_ *_Sky Graphics_* 🎨\n\n` +
                         `━━━━━━━━━━━━━━━━━━━━━━\n` +
                         `*🎮 How to Play:*\n\n` +
-                        `1️⃣ Type *WRG* (all caps) to open a game lobby\n` +
-                        `2️⃣ Type *wrg join* to enter the lobby\n` +
+                        `1️⃣ Type *!wrg start* to open a game lobby\n` +
+                        `2️⃣ Type *!wrg join* to enter the lobby\n` +
                         `3️⃣ Lobby closes after 60 seconds — game begins automatically!\n` +
                         `4️⃣ On your turn, type a *single letter* to guess, or the *full word* to win instantly\n` +
                         `5️⃣ Miss *3 turns in a row* and you're disqualified 🚫\n` +
@@ -558,16 +558,22 @@ async function startBot() {
                 gameState.skipStreaks     = {}
                 gameState.disqualified    = []
 
-                // Creator always auto-joins
-                const creatorEnvJid = process.env.CREATOR_JID || ''
-                const creatorNum    = creatorEnvJid ? creatorEnvJid.split('@')[0].split(':')[0] : ''
-                if (creatorNum && !gameState.players.includes(creatorNum)) {
+                // Auto-join respects each role's individual autoJoin setting.
+                // Creator has their own switch (creatorOverrides.autoJoin).
+                // Admin has their own switch (settings.autoJoin).
+                // Default is ON for both if not explicitly set.
+                const creatorEnvJid    = process.env.CREATOR_JID || ''
+                const creatorNum       = creatorEnvJid ? creatorEnvJid.split('@')[0].split(':')[0] : ''
+                const creatorAutoJoin  = settings.creatorOverrides?.autoJoin !== false
+                const adminAutoJoin    = settings.autoJoin !== false
+
+                if (creatorNum && creatorAutoJoin && !gameState.players.includes(creatorNum)) {
                     gameState.players.push(creatorNum)
                     gameState.playerNames[creatorNum] = nameCache[creatorNum] || 'Creator'
                     gameState.playerJids[creatorNum]  = creatorEnvJid
                 }
-                // Admin also auto-joins if different from creator
-                if (settings.adminNumber && settings.adminNumber !== creatorNum && !gameState.players.includes(settings.adminNumber)) {
+                // Admin also auto-joins if different from creator and switch is ON
+                if (settings.adminNumber && settings.adminNumber !== creatorNum && adminAutoJoin && !gameState.players.includes(settings.adminNumber)) {
                     gameState.players.push(settings.adminNumber)
                     gameState.playerNames[settings.adminNumber] = nameCache[settings.adminNumber] || 'Admin'
                     gameState.playerJids[settings.adminNumber]  = settings.adminJid || `${settings.adminNumber}@s.whatsapp.net`
@@ -587,9 +593,12 @@ async function startBot() {
                     text:
                         `🎮 *Word Riddle Game is Starting!*\n\n` +
                         `🎯 Mode: ${difficultyBadge(difficulty)}\n\n` +
-                        `You have *60 seconds* to type *wrg join* and enter the game! ⏱️\n\n` +
+                        `You have *60 seconds* to join! ⏱️\n\n` +
                         `👥 *Current Lobby:*\n${autoJoinText}\n\n` +
-                        `_Type *wrg join* now before time runs out!_ 🔥`,
+                        `*Commands:*\n` +
+                        `*!wrg join* — Enter the lobby\n` +
+                        `*!wrg help* — See all commands\n\n` +
+                        `_Type *!wrg join* now before time runs out!_ 🔥`,
                     mentions: autoJoinMentions
                 })
 
@@ -600,7 +609,7 @@ async function startBot() {
             }
 
             // ── wrg join / wrg start / wrg help ─────────────
-            if (body.startsWith(settings.prefix)) {
+            if (body.startsWith(settings.prefix) && !body.startsWith(settings.adminPrefix)) {
                 const parts   = body.split(' ')
                 const subCmd  = parts[1]
                 // FIX BUG-03: 2-arg call
@@ -609,7 +618,7 @@ async function startBot() {
                 if (subCmd === 'join') {
                     if (!gameState.lobbyActive) {
                         await sock.sendMessage(from, {
-                            text: `⚠️ No active lobby to join! Type *WRG* (all caps) to start one. 🎮`
+                            text: `⚠️ No active lobby to join! Type *!wrg start* to open one. 🎮`
                         })
                         continue
                     }
@@ -628,7 +637,7 @@ async function startBot() {
                             text:
                                 `✅ *${nameTag(senderNumber, nameCache, settings)} joined the lobby!* 🎉\n\n` +
                                 `👥 *Current Lobby:*\n${lobbyText}\n\n` +
-                                `_Type *wrg join* to hop in!_ ⏱️`,
+                                `_Type *!wrg join* to hop in!_ ⏱️`,
                             mentions: [...new Set([resolveJid(senderNumber, gameState.playerJids), ...lobbyMentions])]
                         })
                         persistGames()
@@ -643,7 +652,7 @@ async function startBot() {
                 if (subCmd === 'start') {
                     if (!gameState.lobbyActive) {
                         await sock.sendMessage(from, {
-                            text: `⚠️ No active lobby! Type *WRG* to open one. 🎮`
+                            text: `⚠️ No active lobby! Type *!wrg start* to open one. 🎮`
                         })
                         continue
                     }
@@ -658,8 +667,8 @@ async function startBot() {
                         text:
                             `🎮 *Welcome to Word Riddle Game (WRG)!*\n\n` +
                             `*How to play:*\n` +
-                            `1️⃣ Type *WRG* (all caps) to open a game lobby\n` +
-                            `2️⃣ Type *wrg join* to enter the lobby\n` +
+                            `1️⃣ Type *!wrg start* to open a game lobby\n` +
+                            `2️⃣ Type *!wrg join* to enter the lobby\n` +
                             `3️⃣ Once the timer hits zero, the game begins automatically!\n` +
                             `4️⃣ On your turn, type a *single letter* to guess it, or the *full word* to win instantly ⚡\n` +
                             `5️⃣ Miss *3 turns in a row* and you're disqualified 🚫\n` +
