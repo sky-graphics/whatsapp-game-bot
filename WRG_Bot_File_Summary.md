@@ -9,7 +9,7 @@ The single source of truth for who's allowed to do what. Every other file asks t
 
 - Resolves a sender's tier — Creator, Admin, or Public — by comparing their number (and a LID fallback) against CREATOR_JID and the saved admin number.
 - Holds `resolveSetting()` / `writeSetting()` — the logic that lets a Creator override always beat whatever the Admin has configured.
-- Provides shared display helpers: `difficultyBadge()` for the 🟢🟡🔴 mode badges, and `nameTag()` so Creator/Admin show with a role label everywhere.
+- Provides shared display helpers: `difficultyBadge()` for the 🟢🟡🔴 mode badges, and `nameTag()` so Creator/Admin show with a role label everywhere.j
 
 *Depends on nothing else in this project. **Everything else depends on it.***
 

@@ -4,7 +4,7 @@
 //  Game logic  → gameEngine.js
 //  Admin logic → adminCommands.js
 // ============================================================
-
+/*
 require('dotenv').config()
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys')
 const { Boom } = require('@hapi/boom')
@@ -822,3 +822,4 @@ async function startBot() {
 }
 
 startBot()
+*/
