@@ -43,30 +43,50 @@ function difficultyBadge(difficulty) {
  *
  * FIX BUG-22: added senderJid as optional third arg with LID fallback
  */
-function getTier(senderNumber, settings, senderJid) {
-    const clean = (senderNumber || '').replace(/[^0-9]/g, '')
+/**
+ * Strip the device suffix from a JID so two JIDs for the same
+ * account (e.g. 237xxx@s.whatsapp.net vs 237xxx:15@lid) can be
+ * compared without false negatives.
+ *   '77705185873989:15@lid'  → '77705185873989@lid'
+ *   '237682477421@s.whatsapp.net' → '237682477421@s.whatsapp.net'
+ */
+function stripDevice(jid) {
+    if (!jid) return ''
+    const [localpart, domain] = jid.split('@')
+    if (!domain) return jid
+    const base = localpart.split(':')[0]
+    return `${base}@${domain}`
+}
 
-    // Creator check — compare plain numbers only, never JIDs
+function getTier(senderNumber, settings, senderJid) {
+    const clean      = (senderNumber || '').replace(/[^0-9]/g, '')
     const creatorJid = process.env.CREATOR_JID || ''
     const creatorNum = creatorJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
 
-    if (creatorNum && clean === creatorNum) return TIERS.CREATOR
+    // ── CREATOR checks ──────────────────────────────────────────
+    // 1. Plain PN digits match (works when WhatsApp routes via @s.whatsapp.net)
+    if (creatorNum && clean && clean === creatorNum) return TIERS.CREATOR
 
-    // LID fallback: extract number from the JID suffix and compare
-    // handles the case where senderNumber is a LID digit string
-    if (senderJid) {
-        const jidNum = senderJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
-        if (creatorNum && jidNum && jidNum === creatorNum) return TIERS.CREATOR
+    // 2. Full JID match — the ONLY reliable check when WhatsApp routes via @lid.
+    //    We compare base JIDs (device suffix stripped) because the same account
+    //    can appear as 'xxx:15@lid' on one message and 'xxx@lid' on another.
+    //    NOTE: LID digits ≠ PN digits — they are completely different number spaces.
+    //    Comparing LID digit strings against PN digit strings always fails. We must
+    //    compare the full JID (same domain, same local part) against the stored JID.
+    if (senderJid && creatorJid) {
+        if (stripDevice(senderJid) === stripDevice(creatorJid)) return TIERS.CREATOR
     }
 
-    // Admin check
+    // ── ADMIN checks ─────────────────────────────────────────────
     const adminNum = (settings.adminNumber || '').replace(/[^0-9]/g, '')
-    if (adminNum && clean === adminNum) return TIERS.ADMIN
 
-    // Admin LID fallback
-    if (senderJid && adminNum) {
-        const jidNum = senderJid.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
-        if (jidNum && jidNum === adminNum) return TIERS.ADMIN
+    // 1. Plain PN digits match
+    if (adminNum && clean && clean === adminNum) return TIERS.ADMIN
+
+    // 2. Full JID match against stored adminJid (may be @lid on modern Baileys)
+    const adminJid = settings.adminJid || ''
+    if (senderJid && adminJid) {
+        if (stripDevice(senderJid) === stripDevice(adminJid)) return TIERS.ADMIN
     }
 
     return TIERS.PUBLIC
@@ -199,6 +219,7 @@ function nameTag(number, nameCache, settings) {
 
 module.exports = {
     TIERS,
+    stripDevice,
     DIFFICULTY_EMOJI,
     DIFFICULTY_LABEL,
     difficultyBadge,

@@ -408,14 +408,28 @@ async function startBot() {
                 senderNumber = ''
             }
 
-            // If senderNumber is still empty at this point:
-            // — Slash commands ALWAYS get through (e.g. /admin onboarding must work
-            //   even when PN resolution fails — senderJid is enough to reply to them)
-            // — Everything else is skipped to avoid processing unidentified messages
-            const isSlashCommand = body.startsWith(settings.adminPrefix)
-            if (!senderNumber && !isSlashCommand) {
-                console.log(`[senderNumber] Could not resolve PN and not a slash command — skipping`)
-                continue
+            // If senderNumber is still empty after all PN resolution attempts,
+            // fall back to the LID's numeric part as a stable session identifier.
+            // A LID number is NOT a phone number but it IS unique and consistent —
+            // the same person will always have the same LID in a given group.
+            // This prevents the bot from silently ignoring every group member
+            // whose PN WhatsApp couldn't provide (the most common log error).
+            if (!senderNumber && sender && sender.includes('@lid')) {
+                const lidNum = sender.split('@')[0].split(':')[0].replace(/[^0-9]/g, '')
+                if (lidNum) {
+                    senderNumber = lidNum
+                    console.log(`[senderNumber] LID fallback identifier: ${lidNum} (real PN unavailable — using LID numeric part)`)
+                }
+            }
+
+            // Still nothing — only slash commands get through (senderJid is enough
+            // to reply to an onboarding request even without any identifier).
+            if (!senderNumber) {
+                const isSlashCommand = body.startsWith(settings.adminPrefix)
+                if (!isSlashCommand) {
+                    console.log(`[senderNumber] Could not resolve any identifier — skipping`)
+                    continue
+                }
             }
 
             // ── senderJid: the JID to DM this sender ─────────
